@@ -1,8 +1,8 @@
 # ayfor
 
 A typewriter emulator, not a text editor. An A4 sheet, one font, no
-delete key. Every keystroke is appended to an open, replayable log — the
-`.strike` file — that proves a human's rhythm typed it, and renders with
+delete key. Every keystroke is appended to an open, replayable log -- the
+`.strike` file -- that proves a human's rhythm typed it, and renders with
 the mechanical character of a real machine: every hammer has its own
 lean, fast typing strikes light, a pause strikes heavy, the ribbon wears
 out (and can be replaced), the paper has grain, the letters press into
@@ -10,7 +10,7 @@ it. Hammer sounds are real: an Olivetti Lettera 22, pitch-bent by strike
 force. Cmd+R replays the manuscript being typed, at the rhythm it was
 typed, with a "- 19 days pass -" title card where you took a weekend off.
 
-- `docs/DESIGN.md` — the idea walked around, the STRIKE v1 file format,
+- `docs/DESIGN.md` - the idea walked around, the STRIKE v1 file format,
   the personality model, key map.
 
 ## Layout
