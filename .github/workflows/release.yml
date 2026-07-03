@@ -1,0 +1,133 @@
+name: release
+
+# Tag a version (v0.1.0) and this builds and publishes:
+#   ayfor-<tag>-macos-arm64.zip     .app bundle + strike CLI (Apple silicon)
+#   ayfor-<tag>-macos-intel.zip     .app bundle + strike CLI (Intel)
+#   ayfor-<tag>-linux-amd64.AppImage
+#   ayfor-<tag>-linux-amd64.tar.gz  plain binaries, for systems without FUSE
+#   ayfor-<tag>-windows-amd64.zip   ayfor.exe + strike.exe
+#
+# macOS artifacts are unsigned and unnotarized: first launch needs
+# right-click -> Open (or xattr -dr com.apple.quarantine ayfor.app).
+# The macOS build is the only one the project can verify by hand; the
+# Linux and Windows builds compile and are shipped in good faith.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest # arm64; the Intel build cross-compiles (clang is multi-arch)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: install fyne packager
+        run: go install fyne.io/tools/cmd/fyne@latest
+      - name: package arm64 and intel apps
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for arch in arm64 amd64; do
+            label=$arch
+            [ "$arch" = amd64 ] && label=intel
+            rm -rf ayfor.app strike stage
+            CGO_ENABLED=1 GOARCH="$arch" fyne package --os darwin --src ./cmd/ayfor \
+              --name ayfor --app-id io.ayfor.app --icon "$PWD/assets/icon.png" \
+              --app-version "$VERSION"
+            if [ -d cmd/ayfor/ayfor.app ]; then mv cmd/ayfor/ayfor.app .; fi
+            test -d ayfor.app
+            CGO_ENABLED=0 GOARCH="$arch" go build -trimpath -o strike ./cmd/strike
+            mkdir stage
+            cp -R ayfor.app strike LICENSE README.md stage/
+            ditto -c -k --sequesterRsrc --keepParent stage "dist/ayfor-${GITHUB_REF_NAME}-macos-${label}.zip"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: install build dependencies (Fyne needs GL/X11 headers, oto needs ALSA)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libasound2-dev
+      - name: build
+        run: |
+          go build -trimpath -o ayfor ./cmd/ayfor
+          go build -trimpath -o strike ./cmd/strike
+      - name: package AppImage and tarball
+        run: |
+          mkdir -p dist AppDir/usr/bin
+          cp ayfor AppDir/usr/bin/
+          cp packaging/linux/ayfor.desktop AppDir/
+          cp assets/icon.png AppDir/ayfor.png
+          install -m 0755 packaging/linux/AppRun AppDir/AppRun
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir \
+            "dist/ayfor-${GITHUB_REF_NAME}-linux-amd64.AppImage"
+          tar czf "dist/ayfor-${GITHUB_REF_NAME}-linux-amd64.tar.gz" ayfor strike LICENSE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  windows:
+    runs-on: windows-latest # hosted image ships MinGW gcc on PATH, which cgo needs
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: toolchain sanity
+        run: gcc --version
+      - name: package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          go install fyne.io/tools/cmd/fyne@latest
+          fyne package --os windows --src ./cmd/ayfor \
+            --name ayfor --app-id io.ayfor.app --icon "$PWD/assets/icon.png" \
+            --app-version "$VERSION"
+          if [ -f cmd/ayfor/ayfor.exe ]; then mv cmd/ayfor/ayfor.exe .; fi
+          test -f ayfor.exe
+          CGO_ENABLED=0 go build -trimpath -o strike.exe ./cmd/strike
+          mkdir dist
+          7z a "dist/ayfor-${GITHUB_REF_NAME}-windows-amd64.zip" ayfor.exe strike.exe LICENSE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  publish:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: release notes from the changelog's top entry
+        run: |
+          awk '/^## /{n++} n==1' CHANGELOG.md > release-notes.md
+          cat release-notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: release-notes.md

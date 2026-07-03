@@ -1,0 +1,11 @@
+Chapter One
+
+It was a dark and stormy night; the rain fell in torrents,
+except at occasional intervals, when it was checked by a
+violent gust of wind which swept up the streets.
+
+---
+
+Chapter Two
+
+The typewriter remembers everything, even this.

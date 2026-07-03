@@ -1,0 +1,10 @@
+/ayfor
+/strike
+*.app
+.claude/
+.agents/
+.DS_Store
+docs/HANDOVER.md
+
+# owner test artifacts, not shipped examples
+examples/copypasta.*

@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    # macOS runner: the full build needs cgo (Fyne/OpenGL, oto/CoreAudio).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        run: go vet ./...
+      # Pinned: @latest makes "CI is green" mean different things on
+      # different days.
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1 ./...
+      - name: test
+        run: go test -race ./...
+      - name: fuzz smoke
+        run: go test ./internal/format/ -run xxx -fuzz FuzzDecode -fuzztime 30s

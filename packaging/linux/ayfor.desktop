@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ayfor
+GenericName=Typewriter
+Comment=A typewriter, not a text editor
+Exec=ayfor
+Icon=ayfor
+Categories=Office;Publishing;
+Terminal=false
