@@ -31,10 +31,10 @@ var (
 	dankInk = color.RGBA{R: 0xEE, G: 0xE8, B: 0xD5, A: 0xFF}
 )
 
-// lightGround is the window fill behind the sheet in normal (light) mode: the
-// paper colour, so the letterbox blends into the page instead of framing it in
-// a hard border.
-var lightGround = color.NRGBA{R: render.PaperColor().R, G: render.PaperColor().G, B: render.PaperColor().B, A: 0xFF}
+// neutralGround is the window fill behind the sheet in normal (light) mode.
+// On fullscreen displays it becomes the letterbox around A4, so keep it dark
+// and neutral instead of paper-coloured glare.
+var neutralGround = color.NRGBA{R: 0x28, G: 0x28, B: 0x28, A: 0xFF}
 
 // paperLum is the luminance of blank paper: the "no ink" end of the scale.
 var paperLum = lum(render.PaperColor().R, render.PaperColor().G, render.PaperColor().B)
@@ -153,7 +153,7 @@ func (u *ui) applyDankChrome() {
 		u.baseline.FillColor = dankGuideColor
 		u.notch.FillColor = dankNotchColor
 	} else {
-		u.bg.FillColor = lightGround
+		u.bg.FillColor = neutralGround
 		u.baseline.FillColor = guideColor
 		u.notch.FillColor = notchColor
 	}

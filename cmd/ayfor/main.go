@@ -115,6 +115,8 @@ type ui struct {
 }
 
 func main() {
+	configureDesktopScale(os.Environ(), os.Setenv)
+
 	a := app.NewWithID("io.ayfor.app")
 	w := a.NewWindow("ayfor")
 
@@ -160,7 +162,7 @@ func main() {
 		}
 	}
 
-	u.bg = canvas.NewRectangle(lightGround)
+	u.bg = canvas.NewRectangle(neutralGround)
 	u.paper = canvas.NewImageFromImage(u.displayImage(u.sess.Doc.Current))
 	u.paper.FillMode = canvas.ImageFillContain
 	u.baseline = canvas.NewRectangle(guideColor)
@@ -183,13 +185,10 @@ func main() {
 	// dark border around the paper-coloured ground on a dark system theme.
 	// The ground fill (u.bg) should reach the window edge.
 	w.SetPadded(false)
-	// A touch wider than A4-contain needs: the extra width is breathing
-	// room for the file dialogs (which are portrait-cramped otherwise) and
-	// costs only a little grey margin either side of the sheet.
-	w.Resize(fyne.NewSize(820, 1000))
+	u.buildMenu()
+	u.resizeA4Window(defaultWindowHeight)
 	u.refreshTitle()
 
-	u.buildMenu()
 	u.bindKeys()
 	u.applyDankChrome()
 	u.comfortWC = [2]int{-1, -1}
@@ -646,6 +645,12 @@ func menuItem(label string, key fyne.KeyName, mod fyne.KeyModifier, action func(
 	return item
 }
 
+func plainShortcutMenuItem(label string, key fyne.KeyName, action func()) *fyne.MenuItem {
+	item := fyne.NewMenuItem(label, action)
+	item.Shortcut = &desktop.CustomShortcut{KeyName: key}
+	return item
+}
+
 func (u *ui) buildMenu() {
 	super := fyne.KeyModifierSuper
 
@@ -742,6 +747,14 @@ func (u *ui) buildMenu() {
 		fyne.NewMenuItem("Sobriety: legless", sobriety(185)),
 	)
 
+	viewMenu := fyne.NewMenu("View",
+		plainShortcutMenuItem("Toggle fullscreen", fyne.KeyF11, u.toggleFullscreen),
+		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem("A4 window: small", func() { u.resizeA4Window(760) }),
+		fyne.NewMenuItem("A4 window: medium", func() { u.resizeA4Window(defaultWindowHeight) }),
+		fyne.NewMenuItem("A4 window: large", func() { u.resizeA4Window(1180) }),
+	)
+
 	// Comfort: display-only chrome. Safe during replay (it never touches the
 	// document), so it is deliberately not wrapped in the replay guard g.
 	pageNoItem := fyne.NewMenuItem("Page number", u.toggleComfortPageNo)
@@ -753,7 +766,7 @@ func (u *ui) buildMenu() {
 	comfortMenu := fyne.NewMenu("Comfort", pageNoItem, wordCountItem, dankItem)
 
 	u.menuSound, u.menuPageNo, u.menuWordCount, u.menuDank = soundItem, pageNoItem, wordCountItem, dankItem
-	u.mainMenu = fyne.NewMainMenu(file, paperMenu, carriageMenu, machineMenu, humanMenu, comfortMenu)
+	u.mainMenu = fyne.NewMainMenu(file, paperMenu, carriageMenu, machineMenu, humanMenu, viewMenu, comfortMenu)
 	u.win.SetMainMenu(u.mainMenu)
 }
 
