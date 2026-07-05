@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"image"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/lajosnagyuk/ayfor/internal/render"
 	"github.com/lajosnagyuk/ayfor/internal/session"
+	"github.com/lajosnagyuk/ayfor/internal/units"
 )
 
 // buildTestUI creates a ui with a real session and renderer but no window
@@ -209,5 +211,119 @@ func TestHumanGap(t *testing.T) {
 		if got := humanGap(c.d); got != c.want {
 			t.Errorf("humanGap(%v) = %q, want %q", c.d, got, c.want)
 		}
+	}
+}
+
+func TestA4WindowSizeForHeight(t *testing.T) {
+	got := a4ContentSizeForHeight(1000)
+	wantAspect := float64(units.PaperWidthMM / units.PaperHeightMM)
+	gotAspect := float64(got.Width / got.Height)
+	if math.Abs(gotAspect-wantAspect) > 0.0001 {
+		t.Fatalf("A4 content aspect = %.6f, want %.6f", gotAspect, wantAspect)
+	}
+	if got.Height != 1000 {
+		t.Fatalf("A4 content height = %v, want 1000", got.Height)
+	}
+
+	got = a4ContentSizeForHeight(0)
+	if got.Height != defaultWindowHeight {
+		t.Fatalf("A4 content fallback height = %v, want %v", got.Height, defaultWindowHeight)
+	}
+}
+
+func TestScaleFromScreenFactorsChoosesLargestValidScale(t *testing.T) {
+	got := scaleFromScreenFactors("eDP-1=2;HDMI-A-1=1.25;bad=x")
+	if got != "2" {
+		t.Fatalf("scaleFromScreenFactors() = %q, want 2", got)
+	}
+}
+
+func TestScaleFromEnvRejectsInvalidValues(t *testing.T) {
+	for _, v := range []string{"", " ", "nope", "0", "-1"} {
+		if got := scaleFromEnv(v); got != "" {
+			t.Fatalf("scaleFromEnv(%q) = %q, want empty", v, got)
+		}
+	}
+	if got := scaleFromEnv(" 1.5 "); got != "1.5" {
+		t.Fatalf("scaleFromEnv() = %q, want 1.5", got)
+	}
+}
+
+func TestConfigureDesktopScale(t *testing.T) {
+	tests := []struct {
+		name string
+		goos string
+		env  []string
+		want string
+	}{
+		{
+			name: "explicit app override wins",
+			goos: "linux",
+			env:  []string{"AYFOR_UI_SCALE=2", "QT_SCALE_FACTOR=1.25"},
+			want: "2",
+		},
+		{
+			name: "existing fyne scale is respected",
+			goos: "linux",
+			env:  []string{"FYNE_SCALE=1.5", "AYFOR_UI_SCALE=2"},
+			want: "",
+		},
+		{
+			name: "linux qt scale factor is used",
+			goos: "linux",
+			env:  []string{"XDG_CURRENT_DESKTOP=KDE", "QT_SCALE_FACTOR=2"},
+			want: "2",
+		},
+		{
+			name: "kde screen factor is used",
+			goos: "linux",
+			env:  []string{"XDG_CURRENT_DESKTOP=KDE", "QT_SCREEN_SCALE_FACTORS=eDP-1=1.5;DP-1=2"},
+			want: "2",
+		},
+		{
+			name: "non-kde linux ignores qt scale factor",
+			goos: "linux",
+			env:  []string{"XDG_CURRENT_DESKTOP=GNOME", "QT_SCALE_FACTOR=2"},
+			want: "auto",
+		},
+		{
+			name: "linux fallback asks fyne for dpi auto detect",
+			goos: "linux",
+			env:  nil,
+			want: "auto",
+		},
+		{
+			name: "windows leaves platform scale alone",
+			goos: "windows",
+			env:  []string{"QT_SCALE_FACTOR=2"},
+			want: "",
+		},
+		{
+			name: "mac explicit app override still works",
+			goos: "darwin",
+			env:  []string{"AYFOR_UI_SCALE=1.5"},
+			want: "1.5",
+		},
+		{
+			name: "mac leaves platform scale alone by default",
+			goos: "darwin",
+			env:  nil,
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got string
+			configureDesktopScaleForGOOS(tt.goos, tt.env, func(key, val string) error {
+				if key == "FYNE_SCALE" {
+					got = val
+				}
+				return nil
+			})
+			if got != tt.want {
+				t.Fatalf("FYNE_SCALE = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
