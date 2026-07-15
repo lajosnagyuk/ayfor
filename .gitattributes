@@ -1,0 +1,10 @@
+# Typewriter package digests cover exact bytes. Keep authored text canonical
+# across Windows and Unix checkouts, and never subject binary assets or frozen
+# release archives to line-ending conversion.
+assets/typewriters/**/*.json text eol=lf
+assets/typewriters/**/*.csv text eol=lf
+assets/typewriters/**/*.txt text eol=lf
+assets/typewriters/**/*.md text eol=lf
+assets/typewriters/**/*.ttf binary
+assets/typewriters/**/*.wav binary
+assets/typewriter-releases/*.aytw binary

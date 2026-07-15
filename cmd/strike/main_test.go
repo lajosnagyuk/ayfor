@@ -27,8 +27,8 @@ func TestPackRejectsInvalidMaterializedAsset(t *testing.T) {
 }
 
 // TestImportWritesAtomically pins the fix for the truncated-output bug:
-// import encodes fully and lands via temp+rename, so a failure leaves
-// nothing at the user's chosen path - never a half-written .strike.
+// import encodes fully and lands via no-replace publication, so a collision
+// leaves the user's existing file untouched and no temporary debris behind.
 func TestImportWritesAtomically(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "in.txt")
@@ -57,25 +57,29 @@ func TestImportWritesAtomically(t *testing.T) {
 		t.Fatal("imported file's hash chain is broken")
 	}
 
-	// Failure path: an unwritable destination directory must error and
-	// leave no file (not even a truncated one) at the target path.
-	roDir := filepath.Join(dir, "ro")
-	if err := os.Mkdir(roDir, 0o555); err != nil {
+	// Failure path: a pre-existing destination must be preserved byte for
+	// byte. Unlike Unix permission bits, this assertion has the same meaning
+	// on Windows and when the test process has elevated privileges.
+	collisionDir := filepath.Join(dir, "collision")
+	if err := os.Mkdir(collisionDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chmod(roDir, 0o755) })
-	target := filepath.Join(roDir, "blocked.strike")
+	target := filepath.Join(collisionDir, "existing.strike")
+	sentinel := []byte("do not overwrite")
+	if err := os.WriteFile(target, sentinel, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := cmdImport([]string{src, target}); err == nil {
-		t.Fatal("import into an unwritable directory must fail")
+		t.Fatal("import over an existing destination must fail")
 	}
-	if _, err := os.Stat(target); !os.IsNotExist(err) {
-		t.Fatalf("failed import left a file at the target path: %v", err)
+	if got, err := os.ReadFile(target); err != nil || string(got) != string(sentinel) {
+		t.Fatalf("failed import changed destination to %q: %v", got, err)
 	}
-	entries, err := os.ReadDir(roDir)
+	entries, err := os.ReadDir(collisionDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
 		t.Fatalf("failed import left debris in the target directory: %v", entries)
 	}
 }

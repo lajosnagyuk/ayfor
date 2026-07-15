@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -25,8 +26,12 @@ func TestSecondOpenIsRefused(t *testing.T) {
 	if _, err := Open(path, nil); !errors.Is(err, ErrLocked) {
 		t.Fatalf("second Open: want ErrLocked, got %v", err)
 	}
-	if _, err := New(filepath.Join(dir, "other.strike"), 1, nil); err != nil {
+	other, err := New(filepath.Join(dir, "other.strike"), 1, nil)
+	if err != nil {
 		t.Fatalf("a different file should still open: %v", err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatalf("close different file: %v", err)
 	}
 }
 
@@ -215,6 +220,9 @@ func TestSaveAsRecoversFromStickyFlushError(t *testing.T) {
 }
 
 func TestCloseRefusesReplacedPathAndSaveAsRecoversDescriptor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows denies pathname replacement while the live manuscript handle is open")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "live.strike")
 	s, err := New(path, 1, nil)

@@ -954,7 +954,15 @@ func (s *Session) Close() error {
 	// goroutine past Close. Idempotent, safe to call on any state.
 	s.stopFlusher()
 	if s.w == nil {
-		return ErrClosed
+		// A partially torn-down session must not retain a Windows share lock or
+		// leak its descriptor. Close is terminal in this state even though it
+		// still reports ErrClosed to the caller.
+		var closeErr error
+		if s.file != nil {
+			closeErr = s.file.Close()
+			s.file = nil
+		}
+		return errors.Join(ErrClosed, closeErr)
 	}
 	if err := ensurePathNamesFile(s.Path, s.file); err != nil {
 		s.startFlusher()
