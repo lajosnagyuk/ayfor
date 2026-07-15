@@ -8,17 +8,22 @@
 package render
 
 import (
+	"container/list"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"math"
 
+	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
+	"golang.org/x/image/font/sfnt"
 	"golang.org/x/image/math/fixed"
 
 	"github.com/lajosnagyuk/ayfor/assets"
 	"github.com/lajosnagyuk/ayfor/internal/page"
+	"github.com/lajosnagyuk/ayfor/internal/typewriter"
 	"github.com/lajosnagyuk/ayfor/internal/units"
 )
 
@@ -47,31 +52,90 @@ type glyphMask struct {
 type Renderer struct {
 	Scale float64 // px per mm
 
-	sfnt      *opentype.Font
-	faces     map[units.Pitch]font.Face
-	cache     map[glyphCacheKey]*glyphMask
-	grainTile []float32 // paper grain noise field, built in New
+	sfnt            *opentype.Font
+	faces           map[units.Pitch]font.Face
+	cache           map[glyphCacheKey]*glyphMask
+	cacheLRU        *list.List
+	cacheEntries    map[glyphCacheKey]*list.Element
+	cachePixels     int64
+	grainTile       []float32 // paper grain noise field, built in New
+	emMM            float64
+	scaleX          float64
+	baselineShiftMM float64
 }
 
 type glyphCacheKey struct {
-	r     rune
+	glyph sfnt.GlyphIndex
 	pitch units.Pitch
+}
+
+type glyphCacheEntry struct {
+	key    glyphCacheKey
+	pixels int64
+}
+
+const (
+	maxRenderScale       = 32.0
+	maxGlyphDimension    = 1024
+	maxGlyphRasterPixels = 1 << 20
+	maxGlyphCachePixels  = 8 << 20
+	maxGlyphCacheEntries = 512
+)
+
+func validScale(scale float64) bool {
+	return scale > 0 && scale <= maxRenderScale && !math.IsNaN(scale) && !math.IsInf(scale, 0)
 }
 
 // New creates a renderer. scale is pixels per millimetre (5.67 ≈ 144 dpi;
 // use ×2 for retina backing).
 func New(scale float64) (*Renderer, error) {
+	if !validScale(scale) {
+		return nil, fmt.Errorf("render: scale must be finite and within 0..%g px/mm", maxRenderScale)
+	}
 	f, err := opentype.Parse(assets.CourierPrimeRegular)
 	if err != nil {
 		return nil, err
 	}
 	return &Renderer{
-		Scale:     scale,
-		sfnt:      f,
-		faces:     make(map[units.Pitch]font.Face),
-		cache:     make(map[glyphCacheKey]*glyphMask),
-		grainTile: buildGrainTile(), // eager: lazy init raced shared renderers
+		Scale:        scale,
+		sfnt:         f,
+		faces:        make(map[units.Pitch]font.Face),
+		cache:        make(map[glyphCacheKey]*glyphMask),
+		cacheLRU:     list.New(),
+		cacheEntries: make(map[glyphCacheKey]*list.Element),
+		grainTile:    buildGrainTile(), // eager: lazy init raced shared renderers
+		scaleX:       1,
 	}, nil
+}
+
+// NewWithProfile creates a renderer from one exact materialized typewriter.
+func NewWithProfile(scale float64, profile *typewriter.Profile) (*Renderer, error) {
+	if profile == nil {
+		return nil, fmt.Errorf("render: nil typewriter profile")
+	}
+	if !validScale(scale) {
+		return nil, fmt.Errorf("render: scale must be finite and within 0..%g px/mm", maxRenderScale)
+	}
+	f, err := opentype.Parse(profile.Font)
+	if err != nil {
+		return nil, err
+	}
+	return &Renderer{
+		Scale: scale, sfnt: f, faces: make(map[units.Pitch]font.Face),
+		cache: make(map[glyphCacheKey]*glyphMask), cacheLRU: list.New(),
+		cacheEntries: make(map[glyphCacheKey]*list.Element), grainTile: buildGrainTile(),
+		emMM:            float64(profile.Manifest.Typeface.EMMicrometres) / 1000,
+		scaleX:          float64(profile.Manifest.Typeface.ScaleXPermille) / 1000,
+		baselineShiftMM: float64(profile.Manifest.Typeface.BaselineShiftUM) / 1000,
+	}, nil
+}
+
+func (r *Renderer) emPixels(p units.Pitch) float64 {
+	emMM := r.emMM
+	if emMM == 0 {
+		emMM = p.SlotMM() / units.CourierAdvanceEM
+	}
+	return emMM * r.Scale
 }
 
 // face returns (creating on demand) the face sized for a pitch.
@@ -79,8 +143,7 @@ func (r *Renderer) face(p units.Pitch) (font.Face, error) {
 	if f, ok := r.faces[p]; ok {
 		return f, nil
 	}
-	emMM := p.SlotMM() / units.CourierAdvanceEM
-	emPX := emMM * r.Scale
+	emPX := r.emPixels(p)
 	f, err := opentype.NewFace(r.sfnt, &opentype.FaceOptions{
 		Size:    emPX, // with DPI 72, size in points == size in pixels
 		DPI:     72,
@@ -93,38 +156,119 @@ func (r *Renderer) face(p units.Pitch) (font.Face, error) {
 	return f, nil
 }
 
+func (r *Renderer) validateGlyphRaster(ru rune, idx sfnt.GlyphIndex, p units.Pitch) error {
+	var buf sfnt.Buffer
+	ppem := fixed.Int26_6(r.emPixels(p)*64 + 0.5)
+	bounds, _, err := r.sfnt.GlyphBounds(&buf, idx, ppem, font.HintingNone)
+	if err != nil {
+		return fmt.Errorf("render: glyph %U bounds: %w", ru, err)
+	}
+	w := bounds.Max.X.Ceil() - bounds.Min.X.Floor()
+	h := bounds.Max.Y.Ceil() - bounds.Min.Y.Floor()
+	if r.scaleX > 1 {
+		w = int(math.Ceil(float64(w) * r.scaleX))
+	}
+	if w < 0 || h < 0 || w > maxGlyphDimension || h > maxGlyphDimension || int64(w)*int64(h) > maxGlyphRasterPixels {
+		return fmt.Errorf("render: refusing unsafe %dx%d glyph raster for %U", w, h, ru)
+	}
+	return nil
+}
+
+func (r *Renderer) cacheGet(key glyphCacheKey) (*glyphMask, bool) {
+	g, ok := r.cache[key]
+	if ok {
+		r.cacheLRU.MoveToFront(r.cacheEntries[key])
+	}
+	return g, ok
+}
+
+func (r *Renderer) cachePut(key glyphCacheKey, g *glyphMask) {
+	pixels := int64(g.mask.Bounds().Dx()) * int64(g.mask.Bounds().Dy())
+	r.cache[key] = g
+	e := r.cacheLRU.PushFront(glyphCacheEntry{key: key, pixels: pixels})
+	r.cacheEntries[key] = e
+	r.cachePixels += pixels
+	for r.cachePixels > maxGlyphCachePixels || len(r.cache) > maxGlyphCacheEntries {
+		oldest := r.cacheLRU.Back()
+		if oldest == nil {
+			break
+		}
+		entry := oldest.Value.(glyphCacheEntry)
+		delete(r.cache, entry.key)
+		delete(r.cacheEntries, entry.key)
+		r.cachePixels -= entry.pixels
+		r.cacheLRU.Remove(oldest)
+	}
+}
+
+func (r *Renderer) resolvedGlyph(ru rune) (sfnt.GlyphIndex, rune, error) {
+	var buf sfnt.Buffer
+	idx, err := r.sfnt.GlyphIndex(&buf, ru)
+	if err != nil {
+		return 0, 0, fmt.Errorf("render: glyph %U index: %w", ru, err)
+	}
+	if idx != 0 {
+		return idx, ru, nil
+	}
+	replacement, err := r.sfnt.GlyphIndex(&buf, '�')
+	if err != nil {
+		return 0, 0, fmt.Errorf("render: replacement glyph index: %w", err)
+	}
+	if replacement != 0 {
+		return replacement, '�', nil
+	}
+	return 0, ru, nil
+}
+
 // glyph rasterizes (and caches) the un-transformed glyph mask.
 func (r *Renderer) glyph(ru rune, p units.Pitch) (*glyphMask, error) {
-	key := glyphCacheKey{ru, p}
-	if g, ok := r.cache[key]; ok {
+	idx, renderRune, err := r.resolvedGlyph(ru)
+	if err != nil {
+		return nil, err
+	}
+	key := glyphCacheKey{idx, p}
+	if g, ok := r.cacheGet(key); ok {
 		return g, nil
 	}
 	f, err := r.face(p)
 	if err != nil {
 		return nil, err
 	}
+	if err := r.validateGlyphRaster(renderRune, idx, p); err != nil {
+		return nil, err
+	}
 	dot := fixed.Point26_6{}
-	dr, mask, maskp, adv, ok := f.Glyph(dot, ru)
+	dr, mask, maskp, adv, ok := f.Glyph(dot, renderRune)
 	if !ok {
 		// Unknown glyph: render the replacement box the font provides
 		// for U+FFFD, or an empty mask as last resort.
 		dr, mask, maskp, adv, ok = f.Glyph(dot, '�')
 		if !ok {
 			g := &glyphMask{mask: image.NewAlpha(image.Rect(0, 0, 1, 1))}
-			r.cache[key] = g
+			r.cachePut(key, g)
 			return g, nil
 		}
 	}
 	// Copy the mask region into an owned image.Alpha.
 	m := image.NewAlpha(image.Rect(0, 0, dr.Dx(), dr.Dy()))
 	draw.Draw(m, m.Bounds(), mask, maskp, draw.Src)
+	offX := dr.Min.X
+	advance := float64(adv) / 64.0
+	if r.scaleX != 1 && m.Bounds().Dx() > 0 {
+		w := max(1, int(float64(m.Bounds().Dx())*r.scaleX+0.5))
+		scaled := image.NewAlpha(image.Rect(0, 0, w, m.Bounds().Dy()))
+		xdraw.ApproxBiLinear.Scale(scaled, scaled.Bounds(), m, m.Bounds(), draw.Src, nil)
+		m = scaled
+		offX = int(float64(offX) * r.scaleX)
+		advance *= r.scaleX
+	}
 	g := &glyphMask{
 		mask:    m,
-		offX:    dr.Min.X,
+		offX:    offX,
 		offY:    dr.Min.Y,
-		advance: float64(adv) / 64.0,
+		advance: advance,
 	}
-	r.cache[key] = g
+	r.cachePut(key, g)
 	return g, nil
 }
 
@@ -213,7 +357,7 @@ func (r *Renderer) stamp(dst *image.RGBA, rec page.StrikeRec, pitch units.Pitch,
 
 	// Pen position: slot centre plus the machine's offsets, in pixels.
 	cx := (rec.XMM + app.DX) * r.Scale
-	cy := (rec.YMM + app.DY) * r.Scale
+	cy := (rec.YMM + app.DY + r.baselineShiftMM) * r.Scale
 	dotX := cx - g.advance/2 // centre the monospace advance on the slot
 	dotY := cy
 

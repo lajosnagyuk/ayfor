@@ -15,7 +15,6 @@ package main
 import (
 	"fmt"
 	"image"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -62,11 +61,7 @@ func (u *ui) startReplay() {
 	}
 	// The session buffers writes; the file on disk is up to 5 s stale
 	// until flushed, and a replay must include the freshest keystrokes.
-	if err := u.sess.Flush(); err != nil {
-		u.showError(err)
-		return
-	}
-	b, err := os.ReadFile(u.sess.Path)
+	b, err := u.sess.Snapshot()
 	if err != nil {
 		u.showError(err)
 		return
@@ -76,8 +71,12 @@ func (u *ui) startReplay() {
 		u.showError(err)
 		return
 	}
+	replayDoc := page.New(f.Header)
+	if u.sess.Profile != nil {
+		replayDoc = page.NewWithProfile(f.Header, u.sess.Profile)
+	}
 	run := &replayRun{
-		doc:     page.New(f.Header),
+		doc:     replayDoc,
 		pageIdx: -1,
 		cancel:  make(chan struct{}),
 	}

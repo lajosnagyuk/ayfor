@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "id": "io.ayfor.typewriters.olympia-splendid-66-1967",
+  "version": "0.1.0",
+  "name": "Olympia Splendid 66 (1967) — Elite demo",
+  "publisher": "ayfor",
+  "description": "An engineering proof package inspired by a 1967 Olympia Splendid 66 with Elite-style 12 CPI escapement.",
+  "fidelity": "inspired",
+  "engine": {
+    "id": "classic-impact",
+    "version": 1
+  },
+  "geometry": {
+    "pitch_cpi": 12,
+    "line_spacing_tenths": 10,
+    "bell_slots_before_margin": 5,
+    "default_margins_tenth_mm": [220, 180, 220, 220]
+  },
+  "typeface": {
+    "family": "Special Elite",
+    "path": "fonts/SpecialElite-Regular.ttf",
+    "em_um": 4050,
+    "scale_x_permille": 920,
+    "baseline_shift_um": 80,
+    "missing_glyph": "U+FFFD"
+  },
+  "mechanics": {
+    "glyph_calibration": "calibration/glyphs.csv"
+  },
+  "sound": {
+    "sample_rate_hz": 44100,
+    "hammer": [
+      "sounds/hammer-01.wav",
+      "sounds/hammer-02.wav",
+      "sounds/hammer-03.wav",
+      "sounds/hammer-04.wav",
+      "sounds/hammer-05.wav"
+    ],
+    "pitch_spread_permille": 35,
+    "gain_min_permille": 600,
+    "gain_max_permille": 960
+  },
+  "licenses": [
+    "licenses/package.txt",
+    "licenses/SpecialElite-Apache-2.0.txt",
+    "licenses/sounds.txt"
+  ],
+  "provenance": "provenance/README.md"
+}

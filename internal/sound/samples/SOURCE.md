@@ -3,9 +3,22 @@
 `strike-01.pcm` .. `strike-05.pcm` are extracted from:
 
     freesound_community-typewriter-olivetti-lettra-22-20217.mp3
+    Work: typewriter-olivetti-lettra-22
+    Creator: keithpeter (Freesound), served by freesound_community
+    Direct source: https://pixabay.com/sound-effects/typewriter-olivetti-lettra-22-20217/
     Downloaded from Pixabay, 2026-07-02.
-    License: Pixabay License (https://pixabay.com/service/license-summary/)
+    License: Pixabay Content License
+    Terms: https://pixabay.com/service/terms/
+    Summary: https://pixabay.com/service/license-summary/
     Free for commercial and non-commercial use, no attribution required.
+
+Processed file SHA-256 values:
+
+    strike-01.pcm  64cb0f4f50678074261ae881179604f86bff89065e8ce6dcee04cb678bd9090e
+    strike-02.pcm  d18f3e225986904845b2201cb7ceb8cf92d7805dc195e82d2a8d4e00ead468a1
+    strike-03.pcm  b55dd91b57e2b832cf8bec2d51317e1793c9b4b2ef9cc8f638269aea6ea61e7b
+    strike-04.pcm  709d6b010dc7165d23aeb01a3a4c158525e879c362148adfba562f8fcaec71cb
+    strike-05.pcm  5ffb7c3a2dd7e6b73a0f741a32044fc43000968a6eb757dc6c6b098b17198958
 
 ## Processing
 

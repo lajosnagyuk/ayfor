@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"image/png"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,7 +20,12 @@ import (
 	"github.com/lajosnagyuk/ayfor/internal/importer"
 	"github.com/lajosnagyuk/ayfor/internal/page"
 	"github.com/lajosnagyuk/ayfor/internal/render"
+	"github.com/lajosnagyuk/ayfor/internal/safefile"
+	"github.com/lajosnagyuk/ayfor/internal/typewriter"
+	"github.com/lajosnagyuk/ayfor/internal/units"
 )
+
+const maxTextImportBytes = 1 << 20
 
 func usage() {
 	fmt.Fprint(os.Stderr, `strike - STRIKE typewriter file toolbox
@@ -27,10 +33,17 @@ func usage() {
 usage:
   strike info    <file.strike>
   strike verify  <file.strike>
-  strike import  [-seed N] <in.txt|.md|any text> <out.strike>
+  strike import  [-seed N] [-typewriter machine.aytw] <in.txt|.md|any text> <out.strike>
   strike export  [-page N] [-scale PXMM] <file.strike> <out.{txt|md|docx|pdf|png}>  (-page/-scale affect png only)
   strike replay  [-speed X] <file.strike>
   strike text    <file.strike>   (plain text to stdout)
+  strike typewriter list
+  strike typewriter inspect <package.aytw>
+  strike typewriter pack <source-dir> <package.aytw>
+  strike typewriter install <package.aytw>
+  strike typewriter remove <id> <version> <sha256:digest>
+  strike typewriter export-builtin <id> <package.aytw>
+  strike validate-version <semver>
 `)
 	os.Exit(2)
 }
@@ -54,6 +67,13 @@ func main() {
 		err = cmdReplay(args)
 	case "text":
 		err = cmdText(args)
+	case "typewriter":
+		err = cmdTypewriter(args)
+	case "validate-version":
+		if len(args) != 1 {
+			usage()
+		}
+		err = typewriter.ValidateVersion(args[0])
 	default:
 		usage()
 	}
@@ -64,27 +84,32 @@ func main() {
 }
 
 func load(path string) (*format.File, error) {
-	b, err := os.ReadFile(path)
+	b, err := safefile.ReadRegular(path, format.MaxFileBytes)
 	if err != nil {
 		return nil, err
 	}
 	return format.Decode(b)
 }
 
-// loadForRender is load plus the model-version check: export, replay and
-// text derive appearance/content from the personality model, and doing
-// that with the wrong model version would misrepresent the manuscript.
-// info and verify stay on plain load - metadata and hash chains are
-// version-independent.
-func loadForRender(path string) (*format.File, error) {
-	f, err := load(path)
+func resolveProfileForFile(f *format.File, registry *typewriter.Registry) (*typewriter.Profile, error) {
+	if f.Header.FormatVersion != format.Version2 {
+		return nil, nil
+	}
+	if registry == nil || f.Header.Typewriter == nil {
+		return nil, fmt.Errorf("v2 document requires a typewriter registry")
+	}
+	tr := f.Header.Typewriter
+	profile, err := registry.Resolve(typewriter.Ref{ID: tr.ID, Version: tr.Version, Digest: tr.Digest})
 	if err != nil {
 		return nil, err
 	}
-	if err := page.VerifyModel(f.Header); err != nil {
+	if profile.Manifest.Engine.ID != tr.EngineID || profile.Manifest.Engine.Version != tr.EngineVersion {
+		return nil, fmt.Errorf("resolved package engine %s/%d does not match document %s/%d", profile.Manifest.Engine.ID, profile.Manifest.Engine.Version, tr.EngineID, tr.EngineVersion)
+	}
+	if err := page.VerifyProfile(f, profile); err != nil {
 		return nil, err
 	}
-	return f, nil
+	return profile, nil
 }
 
 func cmdInfo(args []string) error {
@@ -128,7 +153,15 @@ func cmdInfo(args []string) error {
 	}
 	fmt.Printf("file:         %s\n", args[0])
 	fmt.Printf("created:      %s\n", time.UnixMilli(f.Header.CreatedUnixMS).UTC().Format(time.RFC3339))
-	fmt.Printf("machine seed: %016X (model v%d)\n", f.Header.Seed, f.Header.ModelVersion)
+	if f.Header.FormatVersion == format.Version2 {
+		fmt.Printf("machine seed: %016X\n", f.Header.Seed)
+	} else {
+		fmt.Printf("machine seed: %016X (model v%d)\n", f.Header.Seed, f.Header.ModelVersion)
+	}
+	if f.Header.Typewriter != nil {
+		tr := f.Header.Typewriter
+		fmt.Printf("typewriter:   %s@%s (%s, engine %s/%d)\n", tr.ID, tr.Version, tr.Digest, tr.EngineID, tr.EngineVersion)
+	}
 	fmt.Printf("pitch:        %d cpi, line spacing x%.1f\n", f.Header.Pitch, float64(f.Header.LineSpacing)/10)
 	fmt.Printf("events:       %d (%d strikes, %d sessions, origin %s)\n", len(f.Events), strikes, sessions, origin)
 	fmt.Printf("pages:        %d (%d in the bin)\n", len(d.Pages), tossed)
@@ -155,12 +188,15 @@ func cmdVerify(args []string) error {
 	if err != nil {
 		return err
 	}
+	if res.FirstBad != -1 {
+		return fmt.Errorf("hash chain BROKEN at event %d of %d (%d checkpoints)", res.FirstBad, len(f.Events), res.Checks)
+	}
+	if f.Truncated {
+		return fmt.Errorf("file ends mid-event; valid prefix has %d events (repair by opening it in ayfor)", len(f.Events))
+	}
 	if res.Checks == 0 {
 		fmt.Println("no checkpoints present (empty or very short file)")
 		return nil
-	}
-	if res.FirstBad != -1 {
-		return fmt.Errorf("hash chain BROKEN at event %d of %d (%d checkpoints)", res.FirstBad, len(f.Events), res.Checks)
 	}
 	fmt.Printf("hash chain OK: %d checkpoints over %d events\n", res.Checks, len(f.Events))
 	return nil
@@ -169,11 +205,12 @@ func cmdVerify(args []string) error {
 func cmdImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 	seed := fs.Uint64("seed", 0, "machine seed (0 = derive from time)")
+	typewriterArchive := fs.String("typewriter", "", "bind import to this .aytw package (default: Ayfor Classic)")
 	fs.Parse(args)
 	if fs.NArg() != 2 {
 		usage()
 	}
-	text, err := os.ReadFile(fs.Arg(0))
+	text, err := safefile.ReadRegular(fs.Arg(0), maxTextImportBytes)
 	if err != nil {
 		return err
 	}
@@ -183,7 +220,36 @@ func cmdImport(args []string) error {
 		s = format.DeriveSeed(now)
 	}
 	h := format.DefaultHeader(s, now)
-	events := importer.Import(string(text), h, now)
+	if *typewriterArchive != "" {
+		pkg, err := typewriter.LoadArchive(*typewriterArchive)
+		if err != nil {
+			return err
+		}
+		profile, err := pkg.Profile()
+		if err != nil {
+			return err
+		}
+		if !typewriter.IsLegacyClassic(profile) {
+			pm := profile.Manifest
+			h = format.DefaultHeaderV2(s, now, format.TypewriterRef{
+				ID: profile.Ref.ID, Version: profile.Ref.Version, Digest: profile.Ref.Digest,
+				EngineID: pm.Engine.ID, EngineVersion: pm.Engine.Version,
+			})
+			h.Pitch = units.Pitch(pm.Geometry.PitchCPI)
+			h.LineSpacing = units.LineSpacing(pm.Geometry.LineSpacing)
+			h.Margins = units.Margins{
+				Left: float64(pm.Geometry.DefaultMarginsTenthMM[0]) / 10, Right: float64(pm.Geometry.DefaultMarginsTenthMM[1]) / 10,
+				Top: float64(pm.Geometry.DefaultMarginsTenthMM[2]) / 10, Bottom: float64(pm.Geometry.DefaultMarginsTenthMM[3]) / 10,
+			}
+		}
+	}
+	// Reserve space for Writer's periodic and final CHECK records under the
+	// decoder's total event ceiling.
+	const maxImportedEvents = format.MaxEvents - format.MaxEvents/format.CheckInterval - 16
+	events, err := importer.ImportLimited(string(text), h, now, maxImportedEvents)
+	if err != nil {
+		return err
+	}
 
 	// Encode to memory and write atomically: a failed import must not
 	// leave a truncated .strike under the user's chosen name (the export
@@ -202,7 +268,7 @@ func cmdImport(args []string) error {
 	if err := w.Check(); err != nil {
 		return err
 	}
-	if err := export.AtomicWriteFile(fs.Arg(1), buf.Bytes()); err != nil {
+	if err := export.AtomicCreateFile(fs.Arg(1), buf.Bytes()); err != nil {
 		return err
 	}
 	fmt.Printf("typed %d events into %s (machine seed %016X)\n", len(events), fs.Arg(1), s)
@@ -217,29 +283,68 @@ func cmdExport(args []string) error {
 	if fs.NArg() != 2 {
 		usage()
 	}
-	f, err := loadForRender(fs.Arg(0))
+	f, err := load(fs.Arg(0))
 	if err != nil {
 		return err
 	}
 	d := page.Replay(f)
 	out := fs.Arg(1)
-	switch strings.ToLower(filepath.Ext(out)) {
-	case ".txt":
-		return export.AtomicWriteFile(out, []byte(export.Text(d)))
-	case ".md":
-		return export.AtomicWriteFile(out, []byte(export.Markdown(d)))
+	ext := strings.ToLower(filepath.Ext(out))
+	// Logical exports depend only on the event stream and embedded geometry,
+	// so they remain available when an appearance package is missing.
+	if ext == ".txt" {
+		return export.AtomicCreateFile(out, []byte(export.Text(d)))
+	}
+	if ext == ".md" {
+		return export.AtomicCreateFile(out, []byte(export.Markdown(d)))
+	}
+	if ext != ".docx" && ext != ".pdf" && ext != ".png" {
+		return fmt.Errorf("unknown export format %q (txt, md, docx, pdf, png)", filepath.Ext(out))
+	}
+	if err := page.VerifyModel(f.Header); err != nil {
+		return err
+	}
+	var profile *typewriter.Profile
+	if f.Header.FormatVersion == format.Version2 {
+		registry, err := typewriter.DefaultRegistry()
+		if err != nil {
+			return err
+		}
+		profile, err = resolveProfileForFile(f, registry)
+		if err != nil {
+			return err
+		}
+		d = page.ReplayWithProfile(f, profile)
+	}
+	switch ext {
 	case ".docx":
-		b, err := export.DOCX(d)
+		var b []byte
+		if profile != nil {
+			b, err = export.DOCXWithProfile(d, profile)
+		} else {
+			b, err = export.DOCX(d)
+		}
 		if err != nil {
 			return err
 		}
-		return export.AtomicWriteFile(out, b)
+		return export.AtomicCreateFile(out, b)
 	case ".pdf":
-		b, err := export.PDF(d)
+		var b []byte
+		if profile != nil {
+			r, rerr := render.NewWithProfile(8, profile)
+			if rerr != nil {
+				return rerr
+			}
+			return export.AtomicCreate(out, func(w io.Writer) error {
+				return export.PDFRasterTo(w, d, r)
+			})
+		} else {
+			b, err = export.PDF(d)
+		}
 		if err != nil {
 			return err
 		}
-		return export.AtomicWriteFile(out, b)
+		return export.AtomicCreateFile(out, b)
 	case ".png":
 		if *scale <= 0 {
 			return fmt.Errorf("scale must be positive, got %g", *scale)
@@ -248,7 +353,12 @@ func cmdExport(args []string) error {
 		if *pageN < 1 || *pageN > len(live) {
 			return fmt.Errorf("page %d of %d live pages", *pageN, len(live))
 		}
-		r, err := render.New(*scale)
+		var r *render.Renderer
+		if profile != nil {
+			r, err = render.NewWithProfile(*scale, profile)
+		} else {
+			r, err = render.New(*scale)
+		}
 		if err != nil {
 			return err
 		}
@@ -277,10 +387,9 @@ func cmdExport(args []string) error {
 		if err := png.Encode(&buf, img); err != nil {
 			return err
 		}
-		return export.AtomicWriteFile(out, buf.Bytes())
-	default:
-		return fmt.Errorf("unknown export format %q (txt, md, docx, pdf, png)", filepath.Ext(out))
+		return export.AtomicCreateFile(out, buf.Bytes())
 	}
+	return nil
 }
 
 func cmdReplay(args []string) error {
@@ -290,7 +399,7 @@ func cmdReplay(args []string) error {
 	if fs.NArg() != 1 {
 		usage()
 	}
-	f, err := loadForRender(fs.Arg(0))
+	f, err := load(fs.Arg(0))
 	if err != nil {
 		return err
 	}
@@ -346,7 +455,7 @@ func cmdText(args []string) error {
 	if len(args) != 1 {
 		usage()
 	}
-	f, err := loadForRender(args[0])
+	f, err := load(args[0])
 	if err != nil {
 		return err
 	}

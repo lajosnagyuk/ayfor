@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"image"
 	"image/png"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,7 +13,34 @@ import (
 	"github.com/lajosnagyuk/ayfor/internal/importer"
 	"github.com/lajosnagyuk/ayfor/internal/machine"
 	"github.com/lajosnagyuk/ayfor/internal/page"
+	"github.com/lajosnagyuk/ayfor/internal/units"
 )
+
+func TestRendererRejectsUnsafeScale(t *testing.T) {
+	for _, scale := range []float64{0, -1, math.NaN(), math.Inf(1), maxRenderScale + 1} {
+		if _, err := New(scale); err == nil {
+			t.Fatalf("accepted unsafe scale %v", scale)
+		}
+	}
+}
+
+func TestGlyphCacheDeduplicatesMissingRunesAndStaysBounded(t *testing.T) {
+	r, err := New(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ru := rune(0x10000); ru < 0x12000; ru++ {
+		if _, err := r.glyph(ru, units.Pica); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(r.cache) > maxGlyphCacheEntries {
+		t.Fatalf("cache has %d entries, limit %d", len(r.cache), maxGlyphCacheEntries)
+	}
+	if r.cachePixels > maxGlyphCachePixels {
+		t.Fatalf("cache holds %d pixels, limit %d", r.cachePixels, maxGlyphCachePixels)
+	}
+}
 
 func buildDoc(t *testing.T, text string) *page.Doc {
 	t.Helper()

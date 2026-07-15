@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ebitengine/oto/v3"
+	"github.com/lajosnagyuk/ayfor/internal/typewriter"
 )
 
 // maxVoices bounds how many clips can sound at once. oto's mixer sums
@@ -59,7 +60,8 @@ type voice struct {
 // them. Read runs on oto's audio callback goroutine; Strike/PlayPCM run
 // on the GUI goroutine; mu guards the shared voice list between them.
 type Player struct {
-	bank *Bank
+	bankMu sync.RWMutex
+	bank   *Bank
 
 	// otoPlayer is never read after NewPlayer (except Close), but MUST be
 	// kept: oto registers a GC cleanup on the *oto.Player that closes the
@@ -81,6 +83,14 @@ type Player struct {
 // NewPlayer opens the audio device, builds the sample bank, and starts
 // the single persistent mixer player.
 func NewPlayer() (*Player, error) {
+	return newPlayer(NewBank())
+}
+
+func NewPlayerWithProfile(profile *typewriter.Profile) (*Player, error) {
+	return newPlayer(NewBankWithProfile(profile))
+}
+
+func newPlayer(bank *Bank) (*Player, error) {
 	op := &oto.NewContextOptions{
 		SampleRate:   SampleRate,
 		ChannelCount: 1,
@@ -99,7 +109,7 @@ func NewPlayer() (*Player, error) {
 		// process); the caller records the failure and never retries.
 		return nil, errors.New("sound: audio device not ready after 5s")
 	}
-	p := &Player{bank: NewBank()}
+	p := &Player{bank: bank}
 	p.otoPlayer = ctx.NewPlayer(p)
 	p.otoPlayer.SetBufferSize(otoPlayerBufferSize)
 	p.otoPlayer.Play()
@@ -120,7 +130,22 @@ func (p *Player) Close() {
 // Strike queues the hammer sound for a strike at the given position with
 // the given ink weight. Fire and forget; overlapping strikes mix in Read.
 func (p *Player) Strike(page, row, col, nth int, ink float64) {
-	p.play(p.bank.Pick(page, row, col, nth, ink))
+	p.bankMu.RLock()
+	bank := p.bank
+	p.bankMu.RUnlock()
+	p.play(bank.Pick(page, row, col, nth, ink))
+}
+
+// SetProfile changes future strike sounds without reopening oto's singleton
+// audio context. Voices already queued retain their own PCM and finish safely.
+func (p *Player) SetProfile(profile *typewriter.Profile) {
+	bank := NewBank()
+	if !typewriter.IsLegacyClassic(profile) {
+		bank = NewBankWithProfile(profile)
+	}
+	p.bankMu.Lock()
+	p.bank = bank
+	p.bankMu.Unlock()
 }
 
 // PlayPCM queues an arbitrary PCM16 mono clip at SampleRate (the margin
@@ -157,7 +182,10 @@ func (p *Player) Read(buf []byte) (int, error) {
 		p.acc = make([]int32, n)
 	}
 	acc := p.acc[:n]
-	voices := p.voices
+	// Copy the pointers, not merely the slice header. At the voice cap play
+	// clears/reuses slots in the shared backing array; a header-only snapshot
+	// could observe a nil or replacement midway through this mix.
+	voices := append([]*voice(nil), p.voices...)
 	p.mu.Unlock()
 
 	for i := range acc {

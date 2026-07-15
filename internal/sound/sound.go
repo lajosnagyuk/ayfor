@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
+
+	"github.com/lajosnagyuk/ayfor/internal/typewriter"
 )
 
 const SampleRate = 44100
@@ -34,7 +36,10 @@ var sampleFS embed.FS
 // strike. Decoding once at load time (rather than per strike) keeps the
 // per-strike cost to one resample pass over ~6,174 samples.
 type Bank struct {
-	bases [][]float64 // one per base sample, in [-1, 1]
+	bases       [][]float64 // one per base sample, in [-1, 1]
+	pitchSpread float64
+	gainMin     float64
+	gainMax     float64
 }
 
 // NewBank loads and decodes the embedded strike samples. Panics if the
@@ -47,7 +52,7 @@ func NewBank() *Bank {
 	if err != nil {
 		panic(fmt.Sprintf("sound: embedded samples missing: %v", err))
 	}
-	b := &Bank{bases: make([][]float64, 0, len(entries))}
+	b := &Bank{bases: make([][]float64, 0, len(entries)), pitchSpread: pitchSpread, gainMin: 0.55, gainMax: 1}
 	for _, e := range entries {
 		data, err := sampleFS.ReadFile("samples/" + e.Name())
 		if err != nil {
@@ -57,6 +62,22 @@ func NewBank() *Bank {
 	}
 	if len(b.bases) == 0 {
 		panic("sound: no embedded strike samples found")
+	}
+	return b
+}
+
+// NewBankWithProfile builds a bank from package-owned, already validated
+// PCM16. It makes private decoded copies so registry/package lifetimes cannot
+// mutate audio in flight.
+func NewBankWithProfile(profile *typewriter.Profile) *Bank {
+	b := &Bank{
+		bases:       make([][]float64, 0, len(profile.HammerPCM16)),
+		pitchSpread: float64(profile.Manifest.Sound.PitchSpread) / 1000,
+		gainMin:     float64(profile.Manifest.Sound.GainMin) / 1000,
+		gainMax:     float64(profile.Manifest.Sound.GainMax) / 1000,
+	}
+	for _, pcm := range profile.HammerPCM16 {
+		b.bases = append(b.bases, decodePCM16(pcm))
 	}
 	return b
 }
@@ -85,8 +106,16 @@ func (b *Bank) Pick(page, row, col, nth int, ink float64) []byte {
 	inkNorm := math.Max(0, math.Min(1.2, ink)) / 1.2 // 0 (lightest) .. 1 (heaviest)
 	// Heavier strikes pitch down slightly (rate < 1, longer/deeper);
 	// lighter strikes pitch up slightly (rate > 1, shorter/brighter).
-	rate := 1 + pitchSpread*(1-2*inkNorm)
-	gain := 0.55 + 0.45*inkNorm
+	spread := b.pitchSpread
+	if spread == 0 && b.gainMax == 0 { // zero-value Bank is not public, but keep it nominal in tests
+		spread = pitchSpread
+	}
+	rate := 1 + spread*(1-2*inkNorm)
+	gainMin, gainMax := b.gainMin, b.gainMax
+	if gainMax == 0 {
+		gainMin, gainMax = 0.55, 1
+	}
+	gain := gainMin + (gainMax-gainMin)*inkNorm
 
 	return resampleScaled(b.bases[idx], rate, gain)
 }

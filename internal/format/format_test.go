@@ -193,6 +193,72 @@ func TestResumeWriter(t *testing.T) {
 	}
 }
 
+func TestWriterRefusesDecoderLimitsBeforePublishingEvent(t *testing.T) {
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, DefaultHeader(1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.events = MaxEvents - 1 // a payload must still reserve its final CHECK
+	before := buf.Len()
+	if err := w.Append(Event{Op: OpStrike, Rune: 'x'}); err == nil {
+		t.Fatal("writer accepted payload with no room for final checkpoint")
+	}
+	if buf.Len() != before {
+		t.Fatal("writer published bytes before rejecting event limit")
+	}
+
+	w.events = 0
+	w.bytes = MaxFileBytes - 1
+	before = buf.Len()
+	if err := w.Append(Event{Op: OpStrike, Rune: 'x'}); err == nil {
+		t.Fatal("writer accepted payload beyond byte ceiling")
+	}
+	if buf.Len() != before {
+		t.Fatal("writer published bytes before rejecting byte limit")
+	}
+}
+
+func TestWriterFinalCheckpointIsIdempotentAtEventCeiling(t *testing.T) {
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, DefaultHeader(1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.events = MaxEvents - 1
+	w.dirty = true
+	if err := w.Check(); err != nil {
+		t.Fatal(err)
+	}
+	afterFinal := buf.Len()
+	if err := w.Check(); err != nil {
+		t.Fatalf("second finalization should be a no-op: %v", err)
+	}
+	if buf.Len() != afterFinal || w.events != MaxEvents {
+		t.Fatal("idempotent checkpoint appended another event")
+	}
+}
+
+func TestWriterAllowsPayloadAndPeriodicCheckpointInFinalTwoSlots(t *testing.T) {
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, DefaultHeader(1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.events = MaxEvents - 2
+	w.sinceCheck = CheckInterval - 1
+	// Give the byte accounting ample room; this test isolates event slots.
+	if err := w.Append(Event{Op: OpStrike, Rune: 'x'}); err != nil {
+		t.Fatalf("payload plus its periodic checkpoint should fit: %v", err)
+	}
+	if w.events != MaxEvents || w.dirty {
+		t.Fatalf("events=%d dirty=%v, want a clean final checkpoint at %d", w.events, w.dirty, MaxEvents)
+	}
+	if err := w.Check(); err != nil {
+		t.Fatalf("final Check after periodic boundary should be idempotent: %v", err)
+	}
+}
+
 func TestBytesPerKeystroke(t *testing.T) {
 	var buf bytes.Buffer
 	w, _ := NewWriter(&buf, sampleHeader())

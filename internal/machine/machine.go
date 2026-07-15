@@ -8,6 +8,8 @@ package machine
 import (
 	"math"
 	"unicode"
+
+	"github.com/lajosnagyuk/ayfor/internal/typewriter"
 )
 
 // ModelVersion implemented by this package. Must match the file header;
@@ -58,6 +60,33 @@ type Machine struct {
 }
 
 func New(seed uint64) *Machine { return &Machine{seed: seed} }
+
+// ProfileMachine applies one immutable package's fixed slug calibration on
+// top of the frozen model-v1 mechanics. The classic package has no table and
+// is therefore exactly equivalent to Machine. A future engine version can
+// parameterize the model ranges without changing this compatibility path.
+type ProfileMachine struct {
+	base   *Machine
+	glyphs map[rune]typewriter.GlyphCalibration
+}
+
+func NewWithProfile(seed uint64, profile *typewriter.Profile) *ProfileMachine {
+	return &ProfileMachine{base: New(seed), glyphs: profile.Glyphs}
+}
+
+func (m *ProfileMachine) PaperSeed(page int) uint64 { return m.base.PaperSeed(page) }
+
+func (m *ProfileMachine) StrikeFor(c Context) Strike {
+	s := m.base.StrikeFor(c)
+	if g, ok := m.glyphs[c.Glyph]; ok {
+		s.DX += float64(g.DXMicrometres) / 1000
+		s.DY += float64(g.DYMicrometres) / 1000
+		s.TiltDeg += float64(g.TiltMilliDeg) / 1000
+		s.Ink *= float64(g.InkPermille) / 1000
+		s.Fill = math.Max(0, math.Min(1, s.Fill+float64(g.FillPermille)/1000))
+	}
+	return s
+}
 
 // FNV-1a constants (hash/fnv's offset64 and prime64), for the hand-rolled
 // fold in h.

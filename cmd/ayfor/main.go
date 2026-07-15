@@ -12,8 +12,11 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +29,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/storage"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/lajosnagyuk/ayfor/internal/bell"
 	"github.com/lajosnagyuk/ayfor/internal/export"
@@ -34,12 +38,15 @@ import (
 	"github.com/lajosnagyuk/ayfor/internal/machine"
 	"github.com/lajosnagyuk/ayfor/internal/page"
 	"github.com/lajosnagyuk/ayfor/internal/render"
+	"github.com/lajosnagyuk/ayfor/internal/safefile"
 	"github.com/lajosnagyuk/ayfor/internal/session"
 	"github.com/lajosnagyuk/ayfor/internal/sound"
+	"github.com/lajosnagyuk/ayfor/internal/typewriter"
 	"github.com/lajosnagyuk/ayfor/internal/units"
 )
 
 const renderScale = 8.0 // px per mm; A4 -> 1680 x 2376 backing bitmap
+const maxTextImportBytes = 1 << 20
 
 // maxResidentBitmapBytes bounds the rendered-sheet cache by MEMORY, not
 // sheet count, so a renderScale change cannot silently multiply the
@@ -74,11 +81,14 @@ type ui struct {
 
 	replay *replayRun // nil unless a replay is running
 
-	mainMenu      *fyne.MainMenu // kept so checkmark toggles refresh in place instead of rebuilding
-	menuSound     *fyne.MenuItem
-	menuPageNo    *fyne.MenuItem
-	menuWordCount *fyne.MenuItem
-	menuDank      *fyne.MenuItem
+	mainMenu        *fyne.MainMenu // kept so checkmark toggles refresh in place instead of rebuilding
+	menuSound       *fyne.MenuItem
+	menuPageNo      *fyne.MenuItem
+	menuWordCount   *fyne.MenuItem
+	menuDank        *fyne.MenuItem
+	menuPitch10     *fyne.MenuItem
+	menuPitch12     *fyne.MenuItem
+	menuTypewriters map[*fyne.MenuItem]typewriter.Ref
 
 	lastTitle string // last title actually set; setTitle skips native calls when unchanged
 
@@ -94,6 +104,10 @@ type ui struct {
 	player     *sound.Player // nil until hammer sound is first enabled
 	soundErr   error         // set if opening the audio device failed; do not retry
 	modalDepth int           // blocking dialogs open; > 0 swallows keystrokes and menu intents
+
+	registry        *typewriter.Registry
+	currentProfile  *typewriter.Profile
+	selectedProfile *typewriter.Profile
 
 	// closing: the window is tearing down; replay must not touch the UI.
 	// A plain bool on purpose - it is written in the close intercept and
@@ -119,27 +133,40 @@ func main() {
 
 	a := app.NewWithID("io.ayfor.app")
 	w := a.NewWindow("ayfor")
+	prefs := a.Preferences()
 
-	r, err := render.New(renderScale)
+	registry, err := typewriter.DefaultRegistry()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ayfor:", err)
 		os.Exit(1)
 	}
-
-	sess, err := newUntitledSession()
+	selected, err := selectedTypewriter(registry, prefs)
+	if err != nil {
+		fatalPreferenceDialog(w, prefs, err)
+		return
+	}
+	r, err := rendererForProfile(selected)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ayfor:", err)
+		os.Exit(1)
+	}
+	sess, err := newUntitledSessionWithProfile(selected)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ayfor:", err)
 		os.Exit(1)
 	}
 
 	u := &ui{
-		win:      w,
-		sess:     sess,
-		renderer: r,
-		bitmaps:  map[int]*image.RGBA{},
-		stamped:  map[int]int{},
-		gate:     keygate.New(),
-		prefs:    a.Preferences(),
+		win:             w,
+		sess:            sess,
+		renderer:        r,
+		bitmaps:         map[int]*image.RGBA{},
+		stamped:         map[int]int{},
+		gate:            keygate.New(),
+		prefs:           prefs,
+		registry:        registry,
+		currentProfile:  selected,
+		selectedProfile: selected,
 	}
 	if u.prefs.BoolWithFallback("hammerSound", false) {
 		u.enableSound()
@@ -151,15 +178,8 @@ func main() {
 	// The writer's hand and the machine's wear carry between documents
 	// (mood and sobriety do not). Apply the remembered values to the fresh
 	// draft as SET_ events, so the file stays self-contained and honest.
-	if t := u.prefs.IntWithFallback("touch", 100); t != 100 && t > 0 && t < 256 {
-		if _, err := u.sess.SetTouch(uint8(t)); err != nil {
-			fyne.LogError("apply remembered touch", err)
-		}
-	}
-	if c := u.prefs.IntWithFallback("condition", 100); c != 100 && c > 0 && c < 256 {
-		if _, err := u.sess.SetCondition(uint8(c)); err != nil {
-			fyne.LogError("apply remembered condition", err)
-		}
+	if err := u.applyRememberedState(u.sess); err != nil {
+		fyne.LogError("apply remembered machine state", err)
 	}
 
 	u.bg = canvas.NewRectangle(neutralGround)
@@ -206,22 +226,51 @@ func main() {
 	w.SetCloseIntercept(func() {
 		u.stopReplay()
 		u.stopComfortTicker()
-		// A failed final flush (full disk) keeps the session live: surface it
-		// and abort the quit so the user can recover (Save As to a working
-		// volume rebuilds a fresh writer) instead of losing the buffered tail
-		// silently.
+		finishClose := func() {
+			// Committed to closing: a replay goroutine still winding down must
+			// now skip its UI restore (endReplay) rather than touch a dead canvas.
+			u.closing = true
+			if u.player != nil {
+				u.player.Close()
+			}
+			w.Close()
+		}
+		// A failed final flush (full disk) keeps the session live so Save As can
+		// recover it. A failure after the flush, while closing the OS handle, is
+		// reported separately because that session cannot safely resume.
 		if err := u.sess.Close(); err != nil {
-			u.showError(fmt.Errorf("could not finish saving - your last few seconds are unsaved; try Save As to another disk, then quit: %w", err))
+			if errors.Is(err, session.ErrFinalClose) {
+				u.closing = true
+				u.pushModal()
+				d := dialog.NewError(fmt.Errorf("the manuscript was fully flushed, but the operating system reported an error while closing its file handle; ayfor will close after this message because this session cannot safely resume: %w", err), w)
+				d.SetOnClosed(func() {
+					u.popModal()
+					finishClose()
+				})
+				d.Show()
+			} else {
+				u.showError(fmt.Errorf("could not finish saving - your last few seconds are unsaved; try Save As to another disk, then quit: %w", err))
+				if u.comfortWordCount {
+					u.startComfortTicker()
+				}
+			}
 			return
 		}
-		// Committed to closing: a replay goroutine still winding down must
-		// now skip its UI restore (endReplay) rather than touch a dead canvas.
-		u.closing = true
-		if u.player != nil {
-			u.player.Close()
+		finishClose()
+	})
+	w.ShowAndRun()
+}
+
+func fatalPreferenceDialog(w fyne.Window, prefs fyne.Preferences, err error) {
+	message := widget.NewLabel(err.Error() + "\n\nReset the new-document preference to Ayfor Classic? Existing documents are not changed.")
+	message.Wrapping = fyne.TextWrapWord
+	d := dialog.NewCustomConfirm("Preferred typewriter unavailable", "Reset to Classic", "Quit", message, func(reset bool) {
+		if reset {
+			clearPreferredTypewriter(prefs)
 		}
 		w.Close()
-	})
+	}, w)
+	d.Show()
 	w.ShowAndRun()
 }
 
@@ -258,9 +307,7 @@ func isTextImport(ext string) bool {
 	return false
 }
 
-// newUntitledSession starts a draft. The file is durably written from
-// the first keystroke; "saving" later just renames it out of drafts/.
-func newUntitledSession() (*session.Session, error) {
+func newUntitledSessionWithProfile(profile *typewriter.Profile) (*session.Session, error) {
 	dir := draftsDir()
 	if dir == "" {
 		return nil, fmt.Errorf("cannot locate home directory")
@@ -269,8 +316,287 @@ func newUntitledSession() (*session.Session, error) {
 		return nil, err
 	}
 	now := time.Now()
-	path := filepath.Join(dir, now.Format("2006-01-02-150405")+".strike")
-	return session.New(path, format.DeriveSeed(now.UnixNano()), nil)
+	base := filepath.Join(dir, now.Format("2006-01-02-150405"))
+	seed := format.DeriveSeed(now.UnixNano())
+	for attempt := 1; attempt <= 10_000; attempt++ {
+		path := numberedStrikePath(base+".strike", attempt)
+		var s *session.Session
+		var err error
+		if typewriter.IsLegacyClassic(profile) {
+			s, err = session.New(path, seed, nil)
+		} else {
+			s, err = session.NewWithProfile(path, seed, profile, nil)
+		}
+		if err == nil {
+			return s, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+	}
+	return nil, errors.New("could not allocate a unique draft name after 10000 attempts")
+}
+
+func rendererForProfile(profile *typewriter.Profile) (*render.Renderer, error) {
+	if typewriter.IsLegacyClassic(profile) {
+		return render.New(renderScale)
+	}
+	return render.NewWithProfile(renderScale, profile)
+}
+
+func (u *ui) profileForSession(s *session.Session) (*typewriter.Profile, error) {
+	if s.Profile != nil {
+		return s.Profile, nil
+	}
+	p, err := typewriter.Builtin(typewriter.ClassicID)
+	if err != nil {
+		return nil, err
+	}
+	return p.Profile()
+}
+
+func (u *ui) selectTypewriter(ref typewriter.Ref) {
+	p, err := u.registry.Resolve(ref)
+	if err != nil {
+		u.showError(err)
+		return
+	}
+	if u.currentProfile != nil && u.currentProfile.Ref == p.Ref {
+		u.rememberTypewriter(p)
+		return
+	}
+	message := widget.NewLabel(fmt.Sprintf("Typewriter changes only apply to new documents.\n\nSave the current document and start a new one with %s?", p.Manifest.Name))
+	message.Wrapping = fyne.TextWrapWord
+	u.pushModal()
+	d := dialog.NewCustomConfirm("Change typewriter", "Save and start new", "Cancel", message, func(save bool) {
+		u.popModal()
+		if !save {
+			return
+		}
+		continueSwitch := func() { u.startDocumentWithTypewriter(p) }
+		if isDraft(u.sess.Path) {
+			u.saveAsDialogThen(continueSwitch)
+			return
+		}
+		continueSwitch()
+	}, u.win)
+	d.Show()
+}
+
+func (u *ui) newDocument() {
+	if err := u.newDocumentWithProfile(u.selectedProfile); err != nil {
+		u.showError(err)
+	}
+}
+
+func (u *ui) startDocumentWithTypewriter(profile *typewriter.Profile) {
+	if err := u.newDocumentWithProfile(profile); err != nil {
+		u.showError(err)
+		return
+	}
+	u.rememberTypewriter(profile)
+}
+
+func (u *ui) rememberTypewriter(profile *typewriter.Profile) {
+	u.selectedProfile = profile
+	setPreferredTypewriter(u.prefs, profile.Ref)
+	u.refreshMenuChecks()
+}
+
+func (u *ui) newDocumentWithProfile(profile *typewriter.Profile) error {
+	r, err := rendererForProfile(profile)
+	if err != nil {
+		return err
+	}
+	next, err := newUntitledSessionWithProfile(profile)
+	if err != nil {
+		return err
+	}
+	if err := u.applyRememberedState(next); err != nil {
+		abortErr := next.Abort()
+		return errors.Join(err, abortErr)
+	}
+	if err := u.sess.Close(); err != nil && !errors.Is(err, session.ErrFinalClose) {
+		abortErr := next.Abort()
+		if abortErr != nil {
+			return fmt.Errorf("could not finish the current document: %w; also could not roll back the unused draft: %v", err, abortErr)
+		}
+		return fmt.Errorf("could not finish the current document: %w", err)
+	} else if err != nil {
+		// The complete manuscript reached the OS, but the old *os.File cannot
+		// safely be reused. Continuing with the already-prepared new session is
+		// safer than stranding the UI on a dead writer.
+		fyne.LogError("final close of previous manuscript", err)
+	}
+	u.sess = next
+	u.renderer = r
+	u.currentProfile = profile
+	if u.player != nil {
+		u.player.SetProfile(u.currentProfile)
+	}
+	u.lastCRFull = false
+	u.rerenderAll()
+	u.refreshMenuChecks()
+	u.refreshTitle()
+	return nil
+}
+
+func (u *ui) applyRememberedState(s *session.Session) error {
+	if t := u.prefs.IntWithFallback("touch", 100); t != 100 && t > 0 && t < 256 {
+		if _, err := s.SetTouch(uint8(t)); err != nil {
+			return fmt.Errorf("apply remembered touch: %w", err)
+		}
+	}
+	conditionDefault := 100
+	if typewriter.IsLegacyClassic(s.Profile) {
+		// One-time compatibility with the pre-package global preference.
+		conditionDefault = u.prefs.IntWithFallback("condition", 100)
+	}
+	if c := u.prefs.IntWithFallback(conditionPreferenceKey(s.Profile), conditionDefault); c != 100 && c > 0 && c < 256 {
+		if _, err := s.SetCondition(uint8(c)); err != nil {
+			return fmt.Errorf("apply remembered condition: %w", err)
+		}
+	}
+	return nil
+}
+
+func conditionPreferenceKey(profile *typewriter.Profile) string {
+	if typewriter.IsLegacyClassic(profile) {
+		ref, err := typewriter.LegacyClassicRef()
+		if err == nil {
+			return "condition:" + ref.ID + "@" + ref.Version + ":" + ref.Digest
+		}
+		return "condition:classic"
+	}
+	return "condition:" + profile.Ref.ID + "@" + profile.Ref.Version + ":" + profile.Ref.Digest
+}
+
+func (u *ui) installTypewriterDialog() {
+	fd := dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error) {
+		if err != nil {
+			u.showError(err)
+			return
+		}
+		if rc == nil {
+			return
+		}
+		path := rc.URI().Path()
+		rc.Close()
+		item, err := u.registry.Install(path)
+		if err != nil {
+			u.showError(err)
+			return
+		}
+		u.buildMenu()
+		u.showInfo("Typewriter installed", fmt.Sprintf("Installed %s %s. Choose it from New Document Typewriter when you want to start a document with it.", item.Name, item.Ref.Version))
+	}, u.win)
+	fd.SetFilter(storage.NewExtensionFileFilter([]string{".aytw"}))
+	fd.Show()
+}
+
+func (u *ui) inspectSelectedTypewriter() {
+	p := u.selectedProfile
+	if p == nil {
+		return
+	}
+	m := p.Manifest
+	u.showInfo("Typewriter package", fmt.Sprintf("%s\n%s\n\nPublisher: %s\nFidelity: %s\nEngine: %s/%d\nTypeface: %s\nPitch: %d cpi\n\n%s", m.Name, p.Ref, m.Publisher, m.Fidelity, m.Engine.ID, m.Engine.Version, m.Typeface.Family, m.Geometry.PitchCPI, m.Description))
+}
+
+func (u *ui) removeSelectedTypewriter() {
+	p := u.selectedProfile
+	if p == nil {
+		return
+	}
+	items, err := u.registry.List()
+	if err != nil {
+		u.showError(err)
+		return
+	}
+	for _, item := range items {
+		if item.Ref == p.Ref && item.Builtin {
+			u.showInfo("Built-in package", "Built-in typewriters are retained for document compatibility and cannot be removed.")
+			return
+		}
+	}
+	u.confirm("Remove typewriter package?", fmt.Sprintf("Remove %s? Existing documents bound to this exact package will need it reinstalled before visual rendering.", p.Ref), func() {
+		if err := u.registry.Remove(p.Ref); err != nil {
+			u.showError(err)
+			return
+		}
+		classic, err := typewriter.Builtin(typewriter.ClassicID)
+		if err != nil {
+			u.showError(err)
+			return
+		}
+		fallback, err := classic.Profile()
+		if err != nil {
+			u.showError(err)
+			return
+		}
+		u.selectedProfile = fallback
+		setPreferredTypewriter(u.prefs, fallback.Ref)
+		u.buildMenu()
+	})
+}
+
+func selectedTypewriter(registry *typewriter.Registry, prefs fyne.Preferences) (*typewriter.Profile, error) {
+	classic, err := typewriter.Builtin(typewriter.ClassicID)
+	if err != nil {
+		return nil, err
+	}
+	fallback, err := classic.Profile()
+	if err != nil {
+		return nil, err
+	}
+	var ref typewriter.Ref
+	if encoded := prefs.String("typewriterRef"); encoded != "" {
+		if err := json.Unmarshal([]byte(encoded), &ref); err != nil || ref.ID == "" || ref.Version == "" || ref.Digest == "" {
+			return nil, errors.New("preferred typewriter setting is corrupt")
+		}
+		p, err := registry.Resolve(ref)
+		if err != nil {
+			return nil, fmt.Errorf("preferred typewriter %s is unavailable; reinstall that exact package or explicitly reset to Classic: %w", ref, err)
+		}
+		return p, nil
+	}
+
+	// Migrate the three-key representation used by development builds of the
+	// package feature. Released pre-package ayfor wrote none of these keys.
+	id := prefs.String("typewriterID")
+	version := prefs.String("typewriterVersion")
+	digest := prefs.String("typewriterDigest")
+	if id == "" && version == "" && digest == "" {
+		return fallback, nil
+	}
+	if id == "" || version == "" || digest == "" {
+		return nil, errors.New("preferred typewriter setting is incomplete")
+	}
+	ref = typewriter.Ref{ID: id, Version: version, Digest: digest}
+	p, err := registry.Resolve(ref)
+	if err != nil {
+		return nil, fmt.Errorf("preferred typewriter %s is unavailable; reinstall that exact package or explicitly reset to Classic: %w", ref, err)
+	}
+	setPreferredTypewriter(prefs, ref)
+	return p, nil
+}
+
+func setPreferredTypewriter(prefs fyne.Preferences, ref typewriter.Ref) {
+	b, err := json.Marshal(ref)
+	if err != nil {
+		return
+	}
+	prefs.SetString("typewriterRef", string(b))
+	prefs.RemoveValue("typewriterID")
+	prefs.RemoveValue("typewriterVersion")
+	prefs.RemoveValue("typewriterDigest")
+}
+
+func clearPreferredTypewriter(prefs fyne.Preferences) {
+	prefs.RemoveValue("typewriterRef")
+	prefs.RemoveValue("typewriterID")
+	prefs.RemoveValue("typewriterVersion")
+	prefs.RemoveValue("typewriterDigest")
 }
 
 // isDraft reports whether the session still lives in the drafts folder.
@@ -306,31 +632,24 @@ func (u *ui) setTitle(title string) {
 }
 
 // saveAsDialog names the always-saved draft: a rename, nothing more.
-func (u *ui) saveAsDialog() {
-	fd := dialog.NewFileSave(func(wc fyne.URIWriteCloser, err error) {
-		if err != nil || wc == nil {
-			return
-		}
-		target := wc.URI().Path()
-		wc.Close()
-		if strings.ToLower(filepath.Ext(target)) != ".strike" {
-			target += ".strike"
-		}
-		// The save dialog created an empty placeholder at the chosen
-		// path; remove it so Rename's no-overwrite guard sees the
-		// user's real intent.
-		if fi, statErr := os.Stat(target); statErr == nil && fi.Size() == 0 {
-			os.Remove(target)
-		}
+func (u *ui) saveAsDialog() { u.saveAsDialogThen(nil) }
+
+func (u *ui) saveAsDialogThen(onSaved func()) {
+	u.showPathSaveDialog("Save manuscript as", "Save", ayforDir(), strings.TrimSuffix(filepath.Base(u.sess.Path), ".strike")+".strike", targetWithExtension(".strike"), func(target string) {
 		if err := u.sess.Rename(target); err != nil {
+			if errors.Is(err, session.ErrMoveCleanup) {
+				u.refreshTitle()
+				u.showError(err)
+				return
+			}
 			u.showError(err)
 			return
 		}
 		u.refreshTitle()
-	}, u.win)
-	fd.SetFileName(strings.TrimSuffix(filepath.Base(u.sess.Path), ".strike") + ".strike")
-	u.locateDialog(fd, ayforDir())
-	fd.Show()
+		if onSaved != nil {
+			onSaved()
+		}
+	})
 }
 
 // locateDialog gives a file dialog a comfortable size (most of the
@@ -569,6 +888,13 @@ func (u *ui) showError(err error) {
 	d.Show()
 }
 
+func (u *ui) showInfo(title, message string) {
+	u.pushModal()
+	d := dialog.NewInformation(title, message, u.win)
+	d.SetOnClosed(u.popModal)
+	d.Show()
+}
+
 // confirm displays a blocking yes/no dialog with the same modal guard.
 func (u *ui) confirm(title, message string, onYes func()) {
 	u.pushModal()
@@ -599,7 +925,13 @@ func (u *ui) ensurePlayer(report bool) *sound.Player {
 		return u.player
 	}
 	if u.soundErr == nil {
-		p, err := sound.NewPlayer()
+		var p *sound.Player
+		var err error
+		if !typewriter.IsLegacyClassic(u.currentProfile) {
+			p, err = sound.NewPlayerWithProfile(u.currentProfile)
+		} else {
+			p, err = sound.NewPlayer()
+		}
 		if err == nil {
 			u.player = p
 			return p
@@ -659,6 +991,7 @@ func (u *ui) buildMenu() {
 	g := u.guard
 
 	file := fyne.NewMenu("File",
+		menuItem("New document", fyne.KeyN, super|fyne.KeyModifierShift, g(u.newDocument)),
 		menuItem("Load or import text...", fyne.KeyO, super, g(u.loadDialog)),
 		menuItem("Save As...", fyne.KeyS, super, g(u.saveAsDialog)),
 		menuItem("Export...", fyne.KeyE, super, g(u.exportDialog)),
@@ -713,9 +1046,11 @@ func (u *ui) buildMenu() {
 	sobriety := func(v uint8) func() {
 		return g(func() { u.applyResult(u.sess.SetSobriety(v)) })
 	}
+	pitch10 := fyne.NewMenuItem("Pica (10 cpi)", pitch(10))
+	pitch12 := fyne.NewMenuItem("Elite (12 cpi)", pitch(12))
 	machineMenu := fyne.NewMenu("Machine",
-		fyne.NewMenuItem("Pica (10 cpi)", pitch(10)),
-		fyne.NewMenuItem("Elite (12 cpi)", pitch(12)),
+		pitch10,
+		pitch12,
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Single spacing", spacing(10)),
 		fyne.NewMenuItem("1 1/2 spacing", spacing(15)),
@@ -765,13 +1100,44 @@ func (u *ui) buildMenu() {
 	dankItem.Checked = u.dankOn
 	comfortMenu := fyne.NewMenu("Comfort", pageNoItem, wordCountItem, dankItem)
 
+	typewriterItems := []*fyne.MenuItem{}
+	typewriterRefs := make(map[*fyne.MenuItem]typewriter.Ref)
+	if installed, err := u.registry.List(); err == nil {
+		for _, item := range installed {
+			item := item
+			label := fmt.Sprintf("%s %s (%s)", item.Name, item.Ref.Version, item.Ref.String())
+			if item.Builtin {
+				label += " (built in)"
+			}
+			mi := fyne.NewMenuItem(label, g(func() { u.selectTypewriter(item.Ref) }))
+			mi.Checked = u.selectedProfile != nil && u.selectedProfile.Ref == item.Ref
+			typewriterItems = append(typewriterItems, mi)
+			typewriterRefs[mi] = item.Ref
+		}
+	} else {
+		failed := fyne.NewMenuItem("Typewriters unavailable: "+err.Error(), nil)
+		failed.Disabled = true
+		typewriterItems = append(typewriterItems, failed)
+		fmt.Fprintln(os.Stderr, "ayfor: list typewriters:", err)
+	}
+	typewriterItems = append(typewriterItems,
+		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem("Package details...", g(u.inspectSelectedTypewriter)),
+		fyne.NewMenuItem("Install package...", g(u.installTypewriterDialog)),
+		fyne.NewMenuItem("Remove selected package...", g(u.removeSelectedTypewriter)),
+	)
+	typewritersMenu := fyne.NewMenu("New Document Typewriter", typewriterItems...)
+
 	u.menuSound, u.menuPageNo, u.menuWordCount, u.menuDank = soundItem, pageNoItem, wordCountItem, dankItem
-	u.mainMenu = fyne.NewMainMenu(file, paperMenu, carriageMenu, machineMenu, humanMenu, viewMenu, comfortMenu)
+	u.menuPitch10, u.menuPitch12 = pitch10, pitch12
+	u.menuTypewriters = typewriterRefs
+	u.mainMenu = fyne.NewMainMenu(file, paperMenu, carriageMenu, machineMenu, humanMenu, viewMenu, comfortMenu, typewritersMenu)
 	u.win.SetMainMenu(u.mainMenu)
+	u.refreshMenuChecks()
 }
 
-// refreshMenuChecks updates the checkmarks in place. Rebuilding all six
-// menus and re-registering the native menu bar per toggle wasted work and
+// refreshMenuChecks updates the checkmarks in place. Rebuilding all menus and
+// re-registering the native menu bar per toggle wasted work and
 // could visibly flicker an open menu.
 func (u *ui) refreshMenuChecks() {
 	if u.mainMenu == nil {
@@ -781,6 +1147,12 @@ func (u *ui) refreshMenuChecks() {
 	u.menuPageNo.Checked = u.comfortPageNo
 	u.menuWordCount.Checked = u.comfortWordCount
 	u.menuDank.Checked = u.dankOn
+	fixedPitch := !typewriter.IsLegacyClassic(u.currentProfile)
+	u.menuPitch10.Disabled = fixedPitch
+	u.menuPitch12.Disabled = fixedPitch
+	for item, ref := range u.menuTypewriters {
+		item.Checked = u.selectedProfile != nil && u.selectedProfile.Ref == ref
+	}
 	u.mainMenu.Refresh()
 }
 
@@ -799,7 +1171,7 @@ func (u *ui) stepCondition(delta float64) {
 	next := machine.ClampCondition(u.sess.Doc.Condition() + delta)
 	v := uint8(next*100 + 0.5)
 	u.applyResult(u.sess.SetCondition(v))
-	u.prefs.SetInt("condition", int(v))
+	u.prefs.SetInt(conditionPreferenceKey(u.currentProfile), int(v))
 }
 
 func (u *ui) marginsPreset(l, r, t, b float64) func() {
@@ -856,17 +1228,26 @@ func sameFile(a, b string) bool {
 // Stat-based and so racy in principle; a file created in the gap loses to
 // session.ImportText's O_EXCL open, which fails loudly rather than
 // clobbering - the race costs an error dialog, never data.
-func uniqueStrikePath(base string) string {
-	if _, err := os.Stat(base); os.IsNotExist(err) {
+func numberedStrikePath(base string, attempt int) string {
+	if attempt <= 1 {
 		return base
 	}
 	stem := strings.TrimSuffix(base, ".strike")
-	for i := 2; ; i++ {
-		candidate := fmt.Sprintf("%s (%d).strike", stem, i)
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
+	return fmt.Sprintf("%s (%d).strike", stem, attempt)
+}
+
+func importTextUnique(base, text string, seed uint64, profile *typewriter.Profile) (*session.Session, error) {
+	for attempt := 1; attempt <= 10_000; attempt++ {
+		target := numberedStrikePath(base, attempt)
+		s, err := session.ImportTextWithProfile(target, text, seed, profile, nil)
+		if err == nil {
+			return s, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
 		}
 	}
+	return nil, errors.New("could not allocate a unique import name after 10000 attempts")
 }
 
 func (u *ui) loadPath(path string) {
@@ -888,18 +1269,18 @@ func (u *ui) loadPath(path string) {
 	var err error
 	switch {
 	case ext == ".strike":
-		next, err = session.Open(path, nil)
+		next, err = session.OpenWithRegistry(path, nil, u.registry)
 	case isTextImport(ext):
 		// Any plain-text format: type it in as a machine. The .strike is
 		// written next to the source so the original text is untouched.
-		b, rerr := os.ReadFile(path)
+		b, rerr := safefile.ReadRegular(path, maxTextImportBytes)
 		if rerr != nil {
 			err = rerr
 			break
 		}
-		out := uniqueStrikePath(strings.TrimSuffix(path, filepath.Ext(path)) + ".strike")
+		out := strings.TrimSuffix(path, filepath.Ext(path)) + ".strike"
 		seed := format.DeriveSeed(time.Now().UnixNano())
-		next, err = session.ImportText(out, string(b), seed, nil)
+		next, err = importTextUnique(out, string(b), seed, u.selectedProfile)
 	default:
 		err = fmt.Errorf("cannot load %q: open a .strike file, or a text file (%s) to type in", filepath.Base(path), strings.Join(textImportExts, ", "))
 	}
@@ -907,51 +1288,85 @@ func (u *ui) loadPath(path string) {
 		u.showError(err)
 		return
 	}
-	// The new document is open; close the old one. A failed final flush on
-	// the old file (full disk) would otherwise lose its last few seconds
-	// silently, so surface it - the switch still proceeds.
-	if cerr := u.sess.Close(); cerr != nil {
-		u.showError(fmt.Errorf("the previous document may not have fully saved: %w", cerr))
+	nextProfile, perr := u.profileForSession(next)
+	if perr != nil {
+		_ = next.Abort()
+		u.showError(perr)
+		return
+	}
+	nextRenderer, rerr := rendererForProfile(nextProfile)
+	if rerr != nil {
+		_ = next.Abort()
+		u.showError(rerr)
+		return
+	}
+	// The new document is open; close the old one. A failed final flush on the
+	// old file (full disk) leaves that session live specifically so the user
+	// can recover with Save As. ErrFinalClose is different: every byte was
+	// written but the old handle is unusable, so continuing is the only safe
+	// live state.
+	if cerr := u.sess.Close(); cerr != nil && !errors.Is(cerr, session.ErrFinalClose) {
+		abortErr := next.Abort()
+		if abortErr != nil {
+			u.showError(fmt.Errorf("could not close the previous document; it remains open: %w; also could not roll back the unused target session: %v", cerr, abortErr))
+		} else {
+			u.showError(fmt.Errorf("could not close the previous document; it remains open: %w", cerr))
+		}
+		return
+	} else if cerr != nil {
+		fyne.LogError("final close of previous manuscript", cerr)
 	}
 	u.sess = next
+	u.currentProfile = nextProfile
+	u.renderer = nextRenderer
+	if u.player != nil {
+		u.player.SetProfile(nextProfile)
+	}
 	u.lastCRFull = false // fresh document: no pending end-of-paper Return
 	u.rerenderAll()
+	u.refreshMenuChecks()
 	u.refreshTitle()
 }
 
 func (u *ui) exportDialog() {
-	fd := dialog.NewFileSave(func(wc fyne.URIWriteCloser, err error) {
-		if err != nil || wc == nil {
-			return
-		}
-		// Take the chosen path and close the dialog's own (empty) file: we
-		// write atomically to that path ourselves, so a failed export leaves
-		// no half-written file under the user's name.
-		target := wc.URI().Path()
-		wc.Close()
-		d := u.sess.Doc
-		var data []byte
-		switch strings.ToLower(filepath.Ext(target)) {
-		case ".txt":
-			data = []byte(export.Text(d))
-		case ".md":
-			data = []byte(export.Markdown(d))
-		case ".docx":
-			data, err = export.DOCX(d)
-		case ".pdf":
-			data, err = export.PDF(d)
-		default:
-			err = fmt.Errorf("choose a .txt, .md, .docx or .pdf name")
-		}
-		if err == nil {
-			err = export.AtomicWriteFile(target, data)
-		}
-		if err != nil {
+	base := strings.TrimSuffix(filepath.Base(u.sess.Path), ".strike")
+	u.showPathSaveDialog("Export manuscript", "Export", ayforDir(), base+".pdf", exportTarget, func(target string) {
+		if err := u.exportTo(target); err != nil {
 			u.showError(err)
 		}
-	}, u.win)
-	base := strings.TrimSuffix(filepath.Base(u.sess.Path), ".strike")
-	fd.SetFileName(base + ".pdf")
-	u.locateDialog(fd, ayforDir())
-	fd.Show()
+	})
+}
+
+func (u *ui) exportTo(target string) error {
+	d := u.sess.Doc
+	var data []byte
+	streamed := false
+	var err error
+	switch strings.ToLower(filepath.Ext(target)) {
+	case ".txt":
+		data = []byte(export.Text(d))
+	case ".md":
+		data = []byte(export.Markdown(d))
+	case ".docx":
+		if !typewriter.IsLegacyClassic(u.currentProfile) {
+			data, err = export.DOCXWithProfile(d, u.currentProfile)
+		} else {
+			data, err = export.DOCX(d)
+		}
+	case ".pdf":
+		if !typewriter.IsLegacyClassic(u.currentProfile) {
+			err = export.AtomicCreate(target, func(w io.Writer) error {
+				return export.PDFRasterTo(w, d, u.renderer)
+			})
+			streamed = err == nil
+		} else {
+			data, err = export.PDF(d)
+		}
+	default:
+		err = fmt.Errorf("choose a .txt, .md, .docx or .pdf name")
+	}
+	if err == nil && !streamed {
+		err = export.AtomicCreateFile(target, data)
+	}
+	return err
 }

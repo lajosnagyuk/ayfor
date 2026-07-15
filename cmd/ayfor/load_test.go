@@ -40,27 +40,25 @@ func TestSameFileDetectsIdentity(t *testing.T) {
 	}
 }
 
-// TestUniqueStrikePath pins that importing a text file whose .strike name is
-// taken picks a non-colliding name instead of dead-ending.
-func TestUniqueStrikePath(t *testing.T) {
+// TestImportTextUnique pins that allocation itself is O_EXCL: a collision is
+// retried without a Stat/create race.
+func TestImportTextUnique(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "notes.strike")
-
-	if got := uniqueStrikePath(base); got != base {
-		t.Fatalf("free name should be used as-is: got %q", got)
-	}
 	if err := os.WriteFile(base, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := uniqueStrikePath(base)
-	if got == base {
-		t.Fatal("collided name was reused")
+	s, err := importTextUnique(base, "hello", 1, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(got); !os.IsNotExist(err) {
-		t.Fatalf("chosen name %q is not free", got)
+	defer s.Abort()
+	want := filepath.Join(dir, "notes (2).strike")
+	if s.Path != want {
+		t.Fatalf("import path = %q, want %q", s.Path, want)
 	}
-	if filepath.Ext(got) != ".strike" {
-		t.Fatalf("chosen name lost its extension: %q", got)
+	if b, err := os.ReadFile(base); err != nil || string(b) != "x" {
+		t.Fatalf("colliding source changed to %q, error %v", b, err)
 	}
 }
 

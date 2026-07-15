@@ -3,6 +3,7 @@
 *.app
 .claude/
 .agents/
+.codex/reviews/
 .DS_Store
 docs/HANDOVER.md
 

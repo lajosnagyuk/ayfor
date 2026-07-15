@@ -2,8 +2,33 @@ package sound
 
 import (
 	"encoding/binary"
+	"sync"
 	"testing"
 )
+
+func TestReadAndVoiceCapCanRunConcurrently(t *testing.T) {
+	p := newTestPlayer(t)
+	clip := constPCM(4096, 1000)
+	for range maxVoices {
+		p.PlayPCM(clip)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 256)
+		for range 1000 {
+			_, _ = p.Read(buf)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			p.PlayPCM(clip)
+		}
+	}()
+	wg.Wait()
+}
 
 // newTestPlayer builds a Player without touching the audio device: Strike
 // and Read are pure Go over the voice list, so they're testable headless.

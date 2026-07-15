@@ -179,6 +179,9 @@ func TestDOCXStructure(t *testing.T) {
 	if !strings.Contains(docXML, "Courier Prime") {
 		t.Fatal("docx must set the monospace face")
 	}
+	if !strings.Contains(docXML, `w:cs="Courier New"`) {
+		t.Fatal("legacy DOCX complex-script fallback changed")
+	}
 }
 
 func TestDOCXBoldAndStrike(t *testing.T) {

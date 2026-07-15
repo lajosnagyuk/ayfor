@@ -102,12 +102,12 @@ func TestTextIsPlainNoMarkup(t *testing.T) {
 	}
 }
 
-// TestAtomicWriteFileLeavesNoTemp pins that a successful write renames into
+// TestAtomicCreateFileLeavesNoTemp pins that a successful write publishes into
 // place and leaves no temporary file behind.
-func TestAtomicWriteFileLeavesNoTemp(t *testing.T) {
+func TestAtomicCreateFileLeavesNoTemp(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "out.md")
-	if err := AtomicWriteFile(path, []byte("content")); err != nil {
+	if err := AtomicCreateFile(path, []byte("content")); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(path)

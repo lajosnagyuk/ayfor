@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "id": "io.ayfor.typewriters.classic",
+  "version": "1.0.0",
+  "name": "Ayfor Classic",
+  "publisher": "ayfor",
+  "description": "The original ayfor machine: Courier Prime, deterministic mechanical character, and the original Olivetti-derived hammer bank.",
+  "fidelity": "original",
+  "engine": {
+    "id": "ayfor-classic",
+    "version": 1
+  },
+  "geometry": {
+    "pitch_cpi": 10,
+    "line_spacing_tenths": 10,
+    "bell_slots_before_margin": 6,
+    "default_margins_tenth_mm": [250, 200, 250, 250]
+  },
+  "typeface": {
+    "family": "Courier Prime",
+    "path": "fonts/CourierPrime-Regular.ttf",
+    "em_um": 4233,
+    "scale_x_permille": 1000,
+    "baseline_shift_um": 0,
+    "missing_glyph": "U+FFFD"
+  },
+  "mechanics": {},
+  "sound": {
+    "sample_rate_hz": 44100,
+    "hammer": [
+      "sounds/hammer-01.wav",
+      "sounds/hammer-02.wav",
+      "sounds/hammer-03.wav",
+      "sounds/hammer-04.wav",
+      "sounds/hammer-05.wav"
+    ],
+    "pitch_spread_permille": 60,
+    "gain_min_permille": 550,
+    "gain_max_permille": 1000
+  },
+  "licenses": [
+    "licenses/package.txt",
+    "licenses/CourierPrime-OFL.txt",
+    "licenses/sounds.txt"
+  ],
+  "provenance": "provenance/README.md"
+}

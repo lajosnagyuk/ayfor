@@ -2,7 +2,9 @@
 // app is a single file with no runtime dependencies.
 package assets
 
-import _ "embed"
+import (
+	"embed"
+)
 
 //go:embed fonts/CourierPrime-Regular.ttf
 var CourierPrimeRegular []byte
@@ -13,3 +15,10 @@ var CourierPrimeRegular []byte
 //
 //go:embed fonts/OFL.txt
 var FontLicence []byte
+
+// TypewriterReleases contains immutable, canonical package archives. Old
+// releases stay embedded forever so documents bound to their exact digest do
+// not become unreadable when a newer built-in release is added.
+//
+//go:embed typewriter-releases/*.aytw
+var TypewriterReleases embed.FS
