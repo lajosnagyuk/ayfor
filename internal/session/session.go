@@ -493,7 +493,7 @@ func open(path string, clock Clock, registry *typewriter.Registry) (*Session, er
 	// Lock the exact inode before reading it. Reading by pathname and locking
 	// later creates a TOCTOU window where two processes can both validate and
 	// repair/append the same manuscript.
-	fh, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o644)
+	fh, err := openExistingSession(path)
 	if err != nil {
 		return nil, err
 	}
@@ -1011,18 +1011,36 @@ func (s *Session) Abort() error {
 		s.bw.err = nil
 		return errors.Join(pathErr, removeErr, closeErr)
 	}
-	truncateErr := s.file.Truncate(s.abortAt)
-	var syncErr error
-	if truncateErr == nil {
-		syncErr = s.file.Sync()
+	// Windows cannot truncate below its locked sentinel byte. Rebuild the
+	// exact verified prefix under a replacement lock instead. This is also
+	// stronger on Unix: the rollback is an atomic image replacement, never a
+	// visible truncate followed by a rewrite or an unlocked writer gap.
+	clean := make([]byte, int(s.abortAt))
+	n, readErr := s.file.ReadAt(clean, 0)
+	if errors.Is(readErr, io.EOF) && n == len(clean) {
+		readErr = nil
 	}
-	// Abort is terminal even when rollback itself fails. Restarting the
-	// flusher after a successful truncate would retain a hash state that
-	// includes removed bytes; abandoning the descriptor would leak its lock.
-	closeErr := s.file.Close()
+	if readErr == nil && n != len(clean) {
+		readErr = io.ErrUnexpectedEOF
+	}
+	var replaceErr, closeErr error
+	if readErr == nil {
+		var replacement *os.File
+		replacement, replaceErr = replaceLocked(s.Path, s.file, clean)
+		if replaceErr == nil {
+			s.file = replacement
+			closeErr = replacement.Close()
+		}
+	}
+	if readErr != nil || replaceErr != nil {
+		// Abort is terminal even when rollback itself fails. Closing may report
+		// an already-closed handle if Windows replacement failed after retiring
+		// the old descriptor; preserve both errors for diagnosis.
+		closeErr = errors.Join(closeErr, s.file.Close())
+	}
 	s.bw.buf = nil
 	s.bw.err = nil
 	s.w = nil
 	s.file = nil
-	return errors.Join(truncateErr, syncErr, closeErr)
+	return errors.Join(readErr, replaceErr, closeErr)
 }
