@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/lajosnagyuk/ayfor/internal/page"
+	"github.com/lajosnagyuk/ayfor/internal/typewriter"
 	"github.com/lajosnagyuk/ayfor/internal/units"
 )
 
@@ -16,13 +17,29 @@ import (
 // pitch, bold and strikethrough per the export policy, real page breaks
 // between sheets. Hand-rolled on purpose — the subset we need is tiny.
 func DOCX(d *page.Doc) ([]byte, error) {
+	emMM := d.Pitch.SlotMM() / units.CourierAdvanceEM
+	return docx(d, "Courier Prime", "Courier New", emMM)
+}
+
+// DOCXWithProfile produces the semantic DOCX representation using the
+// package's declared family and physical em size. Office may substitute the
+// face when it is not installed; PNG/PDF remain the appearance-faithful paths.
+func DOCXWithProfile(d *page.Doc, profile *typewriter.Profile) ([]byte, error) {
+	if profile == nil {
+		return nil, fmt.Errorf("export: nil typewriter profile")
+	}
+	return docx(d, profile.Manifest.Typeface.Family, profile.Manifest.Typeface.Family, float64(profile.Manifest.Typeface.EMMicrometres)/1000)
+}
+
+func docx(d *page.Doc, family, complexFamily string, emMM float64) ([]byte, error) {
 	var doc bytes.Buffer
 	doc.WriteString(xml.Header)
 	doc.WriteString(`<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` + "\n<w:body>\n")
 
 	// Font size in half-points from the em implied by the pitch.
-	emMM := d.Pitch.SlotMM() / units.CourierAdvanceEM
 	halfPts := int(emMM*72/units.InchMM*2 + 0.5)
+	family = xmlAttribute(family)
+	complexFamily = xmlAttribute(complexFamily)
 
 	pages := d.LivePages()
 	for pi, p := range pages {
@@ -33,7 +50,7 @@ func DOCX(d *page.Doc) ([]byte, error) {
 			}
 			prevY = line.YHalf
 			doc.WriteString(`<w:p><w:pPr><w:spacing w:after="0"/></w:pPr>`)
-			writeDocxRuns(&doc, line.Cells, halfPts)
+			writeDocxRuns(&doc, line.Cells, halfPts, family, complexFamily)
 			doc.WriteString("</w:p>\n")
 		}
 		if pi < len(pages)-1 {
@@ -82,7 +99,7 @@ func DOCX(d *page.Doc) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func writeDocxRuns(doc *bytes.Buffer, cells []StyledCell, halfPts int) {
+func writeDocxRuns(doc *bytes.Buffer, cells []StyledCell, halfPts int, family, complexFamily string) {
 	end := len(cells)
 	for end > 0 && cells[end-1].Rune == ' ' {
 		end--
@@ -96,7 +113,7 @@ func writeDocxRuns(doc *bytes.Buffer, cells []StyledCell, halfPts int) {
 			j++
 		}
 		var props strings.Builder
-		props.WriteString(`<w:rFonts w:ascii="Courier Prime" w:hAnsi="Courier Prime" w:cs="Courier New"/>`)
+		fmt.Fprintf(&props, `<w:rFonts w:ascii="%s" w:hAnsi="%s" w:cs="%s"/>`, family, family, complexFamily)
 		fmt.Fprintf(&props, `<w:sz w:val="%d"/><w:szCs w:val="%d"/>`, halfPts, halfPts)
 		if style == Bold {
 			props.WriteString(`<w:b/>`)
@@ -112,4 +129,10 @@ func writeDocxRuns(doc *bytes.Buffer, cells []StyledCell, halfPts int) {
 	}
 	// A blank line is preserved by the caller's empty <w:p>; there is
 	// nothing to add here when cells is empty.
+}
+
+func xmlAttribute(s string) string {
+	var b bytes.Buffer
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
 }

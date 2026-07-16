@@ -1,13 +1,49 @@
 package session
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/lajosnagyuk/ayfor/internal/format"
 )
+
+func TestOpenRefusesBrokenCheckpointWithoutRewriting(t *testing.T) {
+	var buf bytes.Buffer
+	w, err := format.NewWriter(&buf, format.DefaultHeader(42, 1_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range format.CheckInterval {
+		if err := w.Append(format.Event{Op: format.OpSpace}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := bytes.Clone(buf.Bytes())
+	// Seed bytes are valid at every value but covered by the checkpoint.
+	original[8] ^= 1
+	path := filepath.Join(t.TempDir(), "tampered.strike")
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, nil); err == nil || !strings.Contains(err.Error(), "hash chain broken") {
+		t.Fatalf("Open tampered file = %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatal("Open rewrote a manuscript with a broken checkpoint")
+	}
+	if _, err := os.Stat(path + ".crashed"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("broken checkpoint should not be crash-repaired: %v", err)
+	}
+}
 
 // writtenText returns the runes struck in a decoded file, in order.
 func writtenText(t *testing.T, path string) string {
@@ -54,10 +90,10 @@ func seedFile(t *testing.T) string {
 	return path
 }
 
-// TestOpenRecoversFromMidStreamCorruption pins that a hard decode error (not
-// just a truncated tail) recovers the readable prefix, backs up the original,
-// and reopens to a verifying, appendable file.
-func TestOpenRecoversFromMidStreamCorruption(t *testing.T) {
+// TestOpenRefusesMidStreamCorruption pins that only a short crash tail is
+// auto-repaired. A hard error may have valid events after it, so amputating
+// the working file would be silent data loss.
+func TestOpenRefusesMidStreamCorruption(t *testing.T) {
 	path := seedFile(t)
 
 	// Append an overflowing varint: a corrupt event, not a clean short tail.
@@ -74,23 +110,22 @@ func TestOpenRecoversFromMidStreamCorruption(t *testing.T) {
 	}
 	fh.Close()
 
-	s, err := Open(path, fakeClock(time.UnixMilli(2_000_000), 100*time.Millisecond))
+	original, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("corrupt file should recover, got %v", err)
-	}
-	// Typing continues on the repaired file.
-	if _, err := s.Strike('d'); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Close(); err != nil {
+	if _, err := Open(path, fakeClock(time.UnixMilli(2_000_000), 100*time.Millisecond)); err == nil {
+		t.Fatal("hard-corrupt file opened and was eligible for destructive repair")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	if got := writtenText(t, path); got != "abcd" {
-		t.Fatalf("recovered text = %q, want abcd", got)
+	if !bytes.Equal(after, original) {
+		t.Fatal("Open rewrote a hard-corrupt manuscript")
 	}
-	if _, err := os.Stat(path + ".crashed"); err != nil {
-		t.Fatalf(".crashed backup missing: %v", err)
+	if _, err := os.Stat(path + ".crashed"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("hard corruption should not masquerade as crash repair: %v", err)
 	}
 }
 

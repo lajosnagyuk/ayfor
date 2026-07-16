@@ -1,0 +1,10 @@
+codepoint,dx_um,dy_um,tilt_mdeg,ink_permille,fill_permille,audio_group
+U+0041,-60,40,-180,1030,20,wide
+U+0045,20,-30,80,980,30,normal
+U+004D,-30,50,-120,1050,15,wide
+U+0053,50,20,190,1010,25,normal
+U+0061,-20,10,-70,990,30,normal
+U+0065,30,-20,100,970,50,normal
+U+006D,-40,30,-130,1040,20,wide
+U+0073,40,10,160,1000,35,normal
+U+003F,80,60,240,1070,10,narrow

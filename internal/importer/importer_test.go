@@ -1,6 +1,7 @@
 package importer
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -136,5 +137,27 @@ func TestReplayDeterminism(t *testing.T) {
 		if a[i] != b[i] {
 			t.Fatalf("event %d differs", i)
 		}
+	}
+}
+
+func TestImportLimitedRejectsExpansionWithoutReturningPartialDocument(t *testing.T) {
+	h := format.DefaultHeader(1, 1)
+	events, err := ImportLimited(strings.Repeat("\t", 100), h, 1, 32)
+	if !errors.Is(err, ErrEventLimit) {
+		t.Fatalf("error = %v, want ErrEventLimit", err)
+	}
+	if events != nil {
+		t.Fatalf("returned %d partial events; want nil", len(events))
+	}
+}
+
+func TestImportLimitedAcceptsInputWithinBudget(t *testing.T) {
+	h := format.DefaultHeader(1, 1)
+	events, err := ImportLimited("hello", h, 1, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 7 { // SESSION, NEW_SHEET, five strikes
+		t.Fatalf("event count = %d, want 7", len(events))
 	}
 }

@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "id": "io.ayfor.typewriters.olympia-sm3-pica-1957",
+  "version": "0.1.0",
+  "name": "Olympia SM3 (1957) — Pica demo",
+  "publisher": "ayfor",
+  "description": "An engineering proof package inspired by a 1957 Olympia SM3 Pica machine.",
+  "fidelity": "inspired",
+  "engine": {
+    "id": "classic-impact",
+    "version": 1
+  },
+  "geometry": {
+    "pitch_cpi": 10,
+    "line_spacing_tenths": 10,
+    "bell_slots_before_margin": 6,
+    "default_margins_tenth_mm": [250, 200, 250, 250]
+  },
+  "typeface": {
+    "family": "Cutive Mono",
+    "path": "fonts/CutiveMono-Regular.ttf",
+    "em_um": 4233,
+    "scale_x_permille": 1000,
+    "baseline_shift_um": 0,
+    "missing_glyph": "U+FFFD"
+  },
+  "mechanics": {
+    "glyph_calibration": "calibration/glyphs.csv"
+  },
+  "sound": {
+    "sample_rate_hz": 44100,
+    "hammer": [
+      "sounds/hammer-01.wav",
+      "sounds/hammer-02.wav",
+      "sounds/hammer-03.wav",
+      "sounds/hammer-04.wav",
+      "sounds/hammer-05.wav"
+    ],
+    "pitch_spread_permille": 45,
+    "gain_min_permille": 550,
+    "gain_max_permille": 1000
+  },
+  "licenses": [
+    "licenses/package.txt",
+    "licenses/CutiveMono-OFL.txt",
+    "licenses/sounds.txt"
+  ],
+  "provenance": "provenance/README.md"
+}

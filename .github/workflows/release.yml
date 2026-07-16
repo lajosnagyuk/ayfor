@@ -1,133 +1,195 @@
 name: release
 
-# Tag a version (v0.1.0) and this builds and publishes:
-#   ayfor-<tag>-macos-arm64.zip     .app bundle + strike CLI (Apple silicon)
-#   ayfor-<tag>-macos-intel.zip     .app bundle + strike CLI (Intel)
-#   ayfor-<tag>-linux-amd64.AppImage
-#   ayfor-<tag>-linux-amd64.tar.gz  plain binaries, for systems without FUSE
-#   ayfor-<tag>-windows-amd64.zip   ayfor.exe + strike.exe
-#
-# macOS artifacts are unsigned and unnotarized: first launch needs
-# right-click -> Open (or xattr -dr com.apple.quarantine ayfor.app).
-# The macOS build is the only one the project can verify by hand; the
-# Linux and Windows builds compile and are shipped in good faith.
-
 on:
   push:
     tags: ["v*"]
 
+# Build jobs need no write token. Only the final publication job receives one.
 permissions:
-  contents: write
+  contents: read
+
+env:
+  FYNE_TOOLS_VERSION: v1.7.2
 
 jobs:
   macos:
-    runs-on: macos-latest # arm64; the Intel build cross-compiles (clang is multi-arch)
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
-      - name: install fyne packager
-        run: go install fyne.io/tools/cmd/fyne@latest
+          cache: true
+      - name: verify and test
+        run: |
+          go run ./cmd/strike validate-version "${GITHUB_REF_NAME#v}"
+          go test ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+      - name: install pinned Fyne packager
+        run: go install "fyne.io/tools/cmd/fyne@${FYNE_TOOLS_VERSION}"
       - name: package arm64 and intel apps
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          ROOT="ayfor-${GITHUB_REF_NAME}"
           mkdir -p dist
           for arch in arm64 amd64; do
             label=$arch
             [ "$arch" = amd64 ] && label=intel
-            rm -rf ayfor.app strike stage
+            rm -rf ayfor.app strike stage "$ROOT"
             CGO_ENABLED=1 GOARCH="$arch" fyne package --os darwin --src ./cmd/ayfor \
               --name ayfor --app-id io.ayfor.app --icon "$PWD/assets/icon.png" \
               --app-version "$VERSION"
             if [ -d cmd/ayfor/ayfor.app ]; then mv cmd/ayfor/ayfor.app .; fi
             test -d ayfor.app
             CGO_ENABLED=0 GOARCH="$arch" go build -trimpath -o strike ./cmd/strike
-            mkdir stage
-            cp -R ayfor.app strike LICENSE README.md stage/
-            ditto -c -k --sequesterRsrc --keepParent stage "dist/ayfor-${GITHUB_REF_NAME}-macos-${label}.zip"
+            mkdir -p stage/third-party-licenses stage/typewriters
+            scripts/bundle-go-licenses.sh stage/third-party-licenses/go
+            cp -R ayfor.app strike LICENSE README.md THIRD_PARTY_NOTICES.md stage/
+            cp assets/fonts/OFL.txt stage/third-party-licenses/CourierPrime-OFL.txt
+            cp assets/typewriters/io.ayfor.typewriters.olympia-sm3-pica-1957/licenses/CutiveMono-OFL.txt stage/third-party-licenses/
+            cp assets/typewriters/io.ayfor.typewriters.olympia-splendid-66-1967/licenses/SpecialElite-Apache-2.0.txt stage/third-party-licenses/
+            cp assets/typewriters/io.ayfor.typewriters.classic/licenses/sounds.txt stage/third-party-licenses/Pixabay-Content-License-Notice.txt
+            cp assets/typewriter-releases/*.aytw stage/typewriters/
+            mv stage "$ROOT"
+            plutil -lint "$ROOT/ayfor.app/Contents/Info.plist"
+            file "$ROOT/ayfor.app/Contents/MacOS/ayfor"
+            ditto -c -k --sequesterRsrc --keepParent "$ROOT" "dist/ayfor-${GITHUB_REF_NAME}-macos-${label}.zip"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos
           path: dist/*
+          if-no-files-found: error
 
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
-      - name: install build dependencies (Fyne needs GL/X11 headers, oto needs ALSA)
+          cache: true
+      - name: validate tag
+        run: go run ./cmd/strike validate-version "${GITHUB_REF_NAME#v}"
+      - name: install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libasound2-dev
-      - name: build
+      - name: test and build
         run: |
+          go test ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
           go build -trimpath -o ayfor ./cmd/ayfor
-          go build -trimpath -o strike ./cmd/strike
-      - name: package AppImage and tarball
+          CGO_ENABLED=0 go build -trimpath -o strike ./cmd/strike
+      - name: assemble release materials
         run: |
-          mkdir -p dist AppDir/usr/bin
-          cp ayfor AppDir/usr/bin/
-          cp packaging/linux/ayfor.desktop AppDir/
-          cp assets/icon.png AppDir/ayfor.png
-          install -m 0755 packaging/linux/AppRun AppDir/AppRun
-          curl -fsSL -o appimagetool \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x appimagetool
-          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir \
-            "dist/ayfor-${GITHUB_REF_NAME}-linux-amd64.AppImage"
-          tar czf "dist/ayfor-${GITHUB_REF_NAME}-linux-amd64.tar.gz" ayfor strike LICENSE README.md
-      - uses: actions/upload-artifact@v4
+          mkdir -p stage/third-party-licenses stage/typewriters
+          scripts/bundle-go-licenses.sh stage/third-party-licenses/go
+          cp ayfor strike LICENSE README.md THIRD_PARTY_NOTICES.md stage/
+          cp assets/fonts/OFL.txt stage/third-party-licenses/CourierPrime-OFL.txt
+          cp assets/typewriters/io.ayfor.typewriters.olympia-sm3-pica-1957/licenses/CutiveMono-OFL.txt stage/third-party-licenses/
+          cp assets/typewriters/io.ayfor.typewriters.olympia-splendid-66-1967/licenses/SpecialElite-Apache-2.0.txt stage/third-party-licenses/
+          cp assets/typewriters/io.ayfor.typewriters.classic/licenses/sounds.txt stage/third-party-licenses/Pixabay-Content-License-Notice.txt
+          cp assets/typewriter-releases/*.aytw stage/typewriters/
+      - name: package tarball
+        run: |
+          mkdir -p dist
+          ! ldd stage/ayfor | grep -F 'not found'
+          ROOT="ayfor-${GITHUB_REF_NAME}"
+          mv stage "$ROOT"
+          tar -czf "dist/ayfor-${GITHUB_REF_NAME}-linux-amd64.tar.gz" "$ROOT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux
           path: dist/*
+          if-no-files-found: error
 
   windows:
-    runs-on: windows-latest # hosted image ships MinGW gcc on PATH, which cgo needs
+    runs-on: windows-2025
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
-      - name: toolchain sanity
-        run: gcc --version
+          cache: true
+      - name: validate toolchain and test
+        run: |
+          go run ./cmd/strike validate-version "${GITHUB_REF_NAME#v}"
+          gcc --version
+          go test ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+      - name: install pinned Fyne packager
+        run: go install "fyne.io/tools/cmd/fyne@${FYNE_TOOLS_VERSION}"
       - name: package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          go install fyne.io/tools/cmd/fyne@latest
           fyne package --os windows --src ./cmd/ayfor \
             --name ayfor --app-id io.ayfor.app --icon "$PWD/assets/icon.png" \
             --app-version "$VERSION"
           if [ -f cmd/ayfor/ayfor.exe ]; then mv cmd/ayfor/ayfor.exe .; fi
           test -f ayfor.exe
           CGO_ENABLED=0 go build -trimpath -o strike.exe ./cmd/strike
-          mkdir dist
-          7z a "dist/ayfor-${GITHUB_REF_NAME}-windows-amd64.zip" ayfor.exe strike.exe LICENSE README.md
-      - uses: actions/upload-artifact@v4
+          mkdir -p stage/third-party-licenses stage/typewriters dist
+          scripts/bundle-go-licenses.sh stage/third-party-licenses/go
+          cp ayfor.exe strike.exe LICENSE README.md THIRD_PARTY_NOTICES.md stage/
+          cp assets/fonts/OFL.txt stage/third-party-licenses/CourierPrime-OFL.txt
+          cp assets/typewriters/io.ayfor.typewriters.olympia-sm3-pica-1957/licenses/CutiveMono-OFL.txt stage/third-party-licenses/
+          cp assets/typewriters/io.ayfor.typewriters.olympia-splendid-66-1967/licenses/SpecialElite-Apache-2.0.txt stage/third-party-licenses/
+          cp assets/typewriters/io.ayfor.typewriters.classic/licenses/sounds.txt stage/third-party-licenses/Pixabay-Content-License-Notice.txt
+          cp assets/typewriter-releases/*.aytw stage/typewriters/
+          ROOT="ayfor-${GITHUB_REF_NAME}"
+          mv stage "$ROOT"
+          objdump -p "$ROOT/ayfor.exe" >/dev/null
+          7z a "dist/ayfor-${GITHUB_REF_NAME}-windows-amd64.zip" "$ROOT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows
           path: dist/*
+          if-no-files-found: error
 
   publish:
     needs: [macos, linux, windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
-      - name: release notes from the changelog's top entry
+      - name: validate release notes and checksums
         run: |
-          awk '/^## /{n++} n==1' CHANGELOG.md > release-notes.md
+          go run ./cmd/strike validate-version "${GITHUB_REF_NAME#v}"
+          grep -Fq "## ${GITHUB_REF_NAME} -" CHANGELOG.md
+          awk -v heading="## ${GITHUB_REF_NAME} -" '
+            /^## / { if (printing) exit; printing = index($0, heading) == 1 }
+            printing
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+          (cd dist && sha256sum * | LC_ALL=C sort > SHA256SUMS)
           cat release-notes.md
-      - uses: softprops/action-gh-release@v2
+          cat dist/SHA256SUMS
+      - name: attest release artifacts
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: dist/*
+      - name: publish GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           body_path: release-notes.md
+          fail_on_unmatched_files: true

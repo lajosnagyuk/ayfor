@@ -9,10 +9,12 @@
 package page
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/lajosnagyuk/ayfor/internal/format"
 	"github.com/lajosnagyuk/ayfor/internal/machine"
+	"github.com/lajosnagyuk/ayfor/internal/typewriter"
 	"github.com/lajosnagyuk/ayfor/internal/units"
 )
 
@@ -23,6 +25,15 @@ import (
 // Callers that only read metadata (info, hash verification) need not
 // check; anything that folds strikes for display or export must.
 func VerifyModel(h format.Header) error {
+	if h.FormatVersion == format.Version2 {
+		if h.Typewriter == nil {
+			return fmt.Errorf("strike: v2 file has no typewriter reference")
+		}
+		if h.Typewriter.EngineVersion != 1 || (h.Typewriter.EngineID != "ayfor-classic" && h.Typewriter.EngineID != "classic-impact") {
+			return fmt.Errorf("strike: file uses unsupported typewriter engine %s/%d", h.Typewriter.EngineID, h.Typewriter.EngineVersion)
+		}
+		return nil
+	}
 	if h.ModelVersion != machine.ModelVersion {
 		return fmt.Errorf("strike: file uses personality model v%d, this build implements v%d; rendering would misrepresent the manuscript", h.ModelVersion, machine.ModelVersion)
 	}
@@ -103,7 +114,7 @@ type Doc struct {
 	YHalf int
 
 	// Machine memory.
-	mach          *machine.Machine
+	mach          appearanceModel
 	prevGlyph     rune
 	ribbonStrikes int     // strikes since the current ribbon was installed
 	ribbon        int     // 0-based index of the installed ribbon spool
@@ -112,11 +123,34 @@ type Doc struct {
 	sobriety      float64 // writer's state, 1.0 = sober (SET_SOBRIETY)
 	condition     float64 // machine wear, 1.0 = factory (SET_CONDITION)
 	clockMS       uint64
+	bellSlots     int // package-defined warning distance; legacy uses units.BellSlots
+	fixedPitch    units.Pitch
+}
+
+type appearanceModel interface {
+	StrikeFor(machine.Context) machine.Strike
+	PaperSeed(int) uint64
 }
 
 // New creates an empty document from a header. No pages exist until a
 // NEW_SHEET event arrives.
 func New(h format.Header) *Doc {
+	return newWithMachine(h, machine.New(h.Seed), units.BellSlots)
+}
+
+// NewWithProfile folds a package-bound document with that package's engine.
+func NewWithProfile(h format.Header, profile *typewriter.Profile) *Doc {
+	if profile == nil {
+		panic("page: nil typewriter profile")
+	}
+	bellSlots := units.BellSlots
+	bellSlots = profile.Manifest.Geometry.BellSlotsBeforeMargin
+	d := newWithMachine(h, machine.NewWithProfile(h.Seed, profile), bellSlots)
+	d.fixedPitch = units.Pitch(profile.Manifest.Geometry.PitchCPI)
+	return d
+}
+
+func newWithMachine(h format.Header, mach appearanceModel, bellSlots int) *Doc {
 	return &Doc{
 		Header:      h,
 		Current:     -1,
@@ -127,7 +161,8 @@ func New(h format.Header) *Doc {
 		disposition: 1.0,
 		sobriety:    1.0,
 		condition:   1.0,
-		mach:        machine.New(h.Seed),
+		mach:        mach,
+		bellSlots:   bellSlots,
 	}
 }
 
@@ -138,6 +173,38 @@ func Replay(f *format.File) *Doc {
 		d.Apply(e)
 	}
 	return d
+}
+
+func ReplayWithProfile(f *format.File, profile *typewriter.Profile) *Doc {
+	d := NewWithProfile(f.Header, profile)
+	for _, e := range f.Events {
+		d.Apply(e)
+	}
+	return d
+}
+
+// VerifyProfile checks the schema-1 capabilities that a package-bound event
+// stream must not override. It runs before any visual fold in sessions and
+// CLI exports; Doc.Apply also refuses a mismatched pitch defensively.
+func VerifyProfile(f *format.File, profile *typewriter.Profile) error {
+	if profile == nil {
+		return errors.New("strike: nil typewriter profile")
+	}
+	g := profile.Manifest.Geometry
+	if int(f.Header.Pitch) != g.PitchCPI || int(f.Header.LineSpacing) != g.LineSpacing {
+		return fmt.Errorf("strike: document geometry does not match fixed package geometry")
+	}
+	for i, mm := range []float64{f.Header.Margins.Left, f.Header.Margins.Right, f.Header.Margins.Top, f.Header.Margins.Bottom} {
+		if int(mm*10+0.5) != g.DefaultMarginsTenthMM[i] {
+			return fmt.Errorf("strike: document starting margins do not match package geometry")
+		}
+	}
+	for i, e := range f.Events {
+		if e.Op == format.OpSetPitch && int(e.Value) != g.PitchCPI {
+			return fmt.Errorf("strike: event %d selects %d cpi on fixed %d cpi package", i, e.Value, g.PitchCPI)
+		}
+	}
+	return nil
 }
 
 func (d *Doc) page() *Page {
@@ -183,7 +250,7 @@ func (d *Doc) YMM(yHalf int) float64 {
 func (d *Doc) AtLock() bool { return d.Col >= d.MaxCol() }
 
 // InBellZone reports whether the carriage is within BellSlots of the stop.
-func (d *Doc) InBellZone() bool { return d.Col >= d.MaxCol()-units.BellSlots }
+func (d *Doc) InBellZone() bool { return d.Col >= d.MaxCol()-d.bellSlots }
 
 func (d *Doc) newSheet() {
 	p := &Page{Cells: make(map[CellKey]*Cell)}
@@ -352,7 +419,9 @@ func (d *Doc) Apply(e format.Event) Result {
 	case format.OpSetPitch:
 		// Ignore an unknown pitch (keep the current one) rather than adopt a
 		// degenerate slot width, matching the guards on the dials below.
-		if p := units.Pitch(e.Value); p.Valid() {
+		if p := units.Pitch(e.Value); d.fixedPitch != 0 && p != d.fixedPitch {
+			res.Applied = false
+		} else if p.Valid() {
 			d.Pitch = p
 		}
 

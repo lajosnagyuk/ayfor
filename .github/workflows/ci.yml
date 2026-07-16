@@ -4,24 +4,82 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
-    # macOS runner: the full build needs cgo (Fyne/OpenGL, oto/CoreAudio).
-    runs-on: macos-latest
+  full:
+    # The complete GUI/audio build needs cgo, OpenGL and a native audio stack.
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
+          cache: true
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: vet
         run: go vet ./...
-      # Pinned: @latest makes "CI is green" mean different things on
-      # different days.
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1 ./...
-      - name: test
+        run: go run honnef.co/go/tools/cmd/staticcheck@2026.1 ./...
+      - name: known-vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+      - name: binary dependency licences
+        run: scripts/bundle-go-licenses.sh "$RUNNER_TEMP/ayfor-go-licenses"
+      - name: race tests
         run: go test -race ./...
-      - name: fuzz smoke
-        run: go test ./internal/format/ -run xxx -fuzz FuzzDecode -fuzztime 30s
+      - name: parser fuzz smoke
+        run: |
+          go test ./internal/format -run '^$' -fuzz '^FuzzDecode$' -fuzztime 20s
+          go test ./internal/typewriter -run '^$' -fuzz '^FuzzLoadArchiveBytes$' -fuzztime 20s
+          go test ./internal/typewriter -run '^$' -fuzz '^FuzzDecodeWAVPCM16$' -fuzztime 20s
+          go test ./internal/typewriter -run '^$' -fuzz '^FuzzParseGlyphCSV$' -fuzztime 20s
+          go test ./internal/typewriter -run '^$' -fuzz '^FuzzFontGeometry$' -fuzztime 20s
+
+  portable:
+    # Exercise the release platforms' security- and compatibility-sensitive
+    # code natively, including Windows file replacement and locks.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Linux GUI/audio build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libasound2-dev
+      - name: full platform tests and GUI build
+        run: |
+          go test ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+          if [ "$RUNNER_OS" = Windows ]; then
+            go build -trimpath -o ayfor-ci.exe ./cmd/ayfor
+          else
+            go build -trimpath -o ayfor-ci ./cmd/ayfor
+          fi
+      - name: Linux dynamic-link smoke
+        if: runner.os == 'Linux'
+        run: |
+          ! ldd ./ayfor-ci | grep -F 'not found'
+          file ./ayfor-ci
+      - name: Windows executable smoke
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          test -f ./ayfor-ci.exe
+          objdump -p ./ayfor-ci.exe >/dev/null

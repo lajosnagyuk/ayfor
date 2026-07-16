@@ -1,7 +1,8 @@
 # ayfor — a typewriter, not a text editor
 
 A4 sheet on screen. One font. No delete. Every keystroke is a timestamped
-strike in an append-only log, replayable to show a human's hands did it.
+strike in an append-only log, replayable to show the recorded typing cadence.
+It is evidence of a process, not authenticated proof of who or what typed it.
 
 This document is (1) a walk around the idea — what the brief missed and the
 decisions taken, (2) the file format specification, (3) the machine

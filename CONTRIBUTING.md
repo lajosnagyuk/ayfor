@@ -25,3 +25,12 @@ purpose), zero emojis in code, comments state constraints rather than
 narrate, and every bug fix lands with a test that pins it. Run
 `gofmt`, `go vet`, `go test -race ./...` before pushing; CI runs the
 same plus staticcheck and a fuzz smoke.
+
+## Contribution licence
+
+By submitting a contribution, you agree to license it under the repository's
+BSD-3-Clause licence (inbound equals outbound) and represent that you have the
+right to do so. Do not submit fonts, recordings, scans, calibration data, or
+other third-party material unless its redistribution terms are compatible and
+the package carries the complete licence and provenance record required by the
+AYTW format.

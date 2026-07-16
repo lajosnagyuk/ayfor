@@ -1,0 +1,19 @@
+Olivetti Lettera 22 recording excerpts
+
+The five hammer WAV files are processed excerpts of the 1:46 MP3 field
+recording "typewriter-olivetti-lettra-22" by keithpeter (Freesound), served by
+Pixabay's freesound_community account:
+
+https://pixabay.com/sound-effects/typewriter-olivetti-lettra-22-20217/
+
+Downloaded 2026-07-02 under the Pixabay Content License. The legally binding
+terms and the human-readable summary are available at:
+
+https://pixabay.com/service/terms/
+https://pixabay.com/service/license-summary/
+
+The strikes were isolated, trimmed to 140 ms, faded, filtered, compressed,
+peak-normalised and encoded as mono PCM16 at 44.1 kHz. They are distributed as
+integrated components of ayfor/typewriter packages, not as a standalone copy
+or substitute for the source recording. Attribution is not required by the
+licence, but is retained here as a permanent provenance record.

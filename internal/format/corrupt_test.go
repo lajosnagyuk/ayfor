@@ -120,6 +120,19 @@ func TestOverflowDeltaIsCorruptNotTruncated(t *testing.T) {
 	}
 }
 
+func TestNoncanonicalVarintsAreCorrupt(t *testing.T) {
+	header := EncodeHeader(sampleHeader())
+	for _, stream := range [][]byte{
+		{0x80, 0x00, OpSpace},              // overlong zero delta
+		{0x00, OpStrike, 0xE1, 0x80, 0x00}, // overlong U+0061
+	} {
+		f, err := Decode(append(bytes.Clone(header), stream...))
+		if err == nil || !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("Decode(%x): file=%v err=%v, want ErrCorrupt", stream, f, err)
+		}
+	}
+}
+
 // TestOverflowRuneIsCorrupt pins the rune-varint arm of the same fix.
 func TestOverflowRuneIsCorrupt(t *testing.T) {
 	var raw []byte

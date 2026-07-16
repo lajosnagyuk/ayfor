@@ -1,9 +1,11 @@
 package session
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -24,8 +26,12 @@ func TestSecondOpenIsRefused(t *testing.T) {
 	if _, err := Open(path, nil); !errors.Is(err, ErrLocked) {
 		t.Fatalf("second Open: want ErrLocked, got %v", err)
 	}
-	if _, err := New(filepath.Join(dir, "other.strike"), 1, nil); err != nil {
+	other, err := New(filepath.Join(dir, "other.strike"), 1, nil)
+	if err != nil {
 		t.Fatalf("a different file should still open: %v", err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatalf("close different file: %v", err)
 	}
 }
 
@@ -49,6 +55,94 @@ func TestLockReleasedOnClose(t *testing.T) {
 		t.Fatalf("reopen after close should succeed: %v", err)
 	}
 	s2.Close()
+}
+
+func TestRepairReplacementKeepsNewInodeLocked(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "repair-lock.strike")
+	s, err := New(path, 42, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.Write([]byte{0x80}) // truncated varint tail
+	_ = f.Close()
+	repaired, err := Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repaired.Close()
+	if _, err := Open(path, nil); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second open after inode-replacing repair = %v, want ErrLocked", err)
+	}
+}
+
+func TestOpenRefusesSymlinkManuscriptPath(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real.strike")
+	s, err := New(realPath, 42, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.strike")
+	if err := os.Symlink(realPath, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	before, _ := os.ReadFile(realPath)
+	if _, err := Open(link, nil); err == nil {
+		t.Fatal("opened manuscript through symlink")
+	}
+	after, _ := os.ReadFile(realPath)
+	if !bytes.Equal(before, after) {
+		t.Fatal("symlink open mutated its target")
+	}
+}
+
+func TestAbortRollsBackPreparedSessions(t *testing.T) {
+	dir := t.TempDir()
+	createdPath := filepath.Join(dir, "unused-draft.strike")
+	created, err := New(createdPath, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(createdPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("aborted draft still exists: %v", err)
+	}
+
+	path := filepath.Join(dir, "existing.strike")
+	original, err := New(path, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := original.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path)
+	prepared, err := Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepared.SetTouch(85); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(after, before) {
+		t.Fatal("aborting an unused opened session left marker/state events behind")
+	}
 }
 
 // TestSaveAsRecoversFromStickyFlushError pins that after a flush failure
@@ -122,5 +216,57 @@ func TestSaveAsRecoversFromStickyFlushError(t *testing.T) {
 	}
 	if string(typed) != "hellox" {
 		t.Fatalf("lost keystrokes across recovery: got %q, want %q", string(typed), "hellox")
+	}
+}
+
+func TestCloseRefusesReplacedPathAndSaveAsRecoversDescriptor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows denies pathname replacement while the live manuscript handle is open")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "live.strike")
+	s, err := New(path, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Strike('x'); err != nil {
+		t.Fatal(err)
+	}
+	orphanName := filepath.Join(dir, "unlinked-original")
+	if err := os.Rename(path, orphanName); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("rival"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err == nil {
+		t.Fatal("close silently accepted replaced manuscript pathname")
+	}
+	recovered := filepath.Join(dir, "recovered.strike")
+	err = s.Rename(recovered)
+	if err != nil && !errors.Is(err, ErrMoveCleanup) {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := format.Decode(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range f.Events {
+		found = found || e.Op == format.OpStrike && e.Rune == 'x'
+	}
+	if !found {
+		t.Fatal("Save As did not recover strike from locked descriptor")
+	}
+	rival, err := os.ReadFile(path)
+	if err != nil || string(rival) != "rival" {
+		t.Fatalf("recovery altered rival replacement: %q, %v", rival, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

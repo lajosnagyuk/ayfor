@@ -55,6 +55,7 @@ func typePage(t *testing.T, u *ui, text string) {
 // the resident set never grows unbounded.
 func TestBitmapLRUBoundsResidentSet(t *testing.T) {
 	u := buildTestUI(t)
+	defer u.sess.Close()
 
 	pages := maxResidentBitmaps * 3
 	for i := range pages {
@@ -95,6 +96,7 @@ func TestBitmapLRUBoundsResidentSet(t *testing.T) {
 // bitmap as the first render, so evicting it is invisible to the owner.
 func TestBitmapReRenderIsByteIdentical(t *testing.T) {
 	u := buildTestUI(t)
+	defer u.sess.Close()
 	typePage(t, u, "the quick brown fox")
 	typePage(t, u, "jumps over the lazy dog")
 
@@ -125,6 +127,7 @@ func TestBitmapReRenderIsByteIdentical(t *testing.T) {
 // worse - skip strikes that aren't. Confirm both maps evict together.
 func TestBitmapStampedResetsOnEviction(t *testing.T) {
 	u := buildTestUI(t)
+	defer u.sess.Close()
 	typePage(t, u, "hello")
 	u.bitmap(0)
 	if _, ok := u.stamped[0]; !ok {
